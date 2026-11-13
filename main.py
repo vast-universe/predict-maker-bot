@@ -359,6 +359,23 @@ def _market_budget(portfolio: PaperPortfolio, config: Config) -> float:
     return max(0.0, min(config.maker_market_budget, portfolio.cash))
 
 
+_REBALANCE_LAST: dict[str, float] = {}
+
+
+def _rebalance_ready(config: Config, snapshot) -> bool:
+    """Rate-limit taker rebalances per market.
+
+    The wallet lifts ~10 shares at a time and does not chain those lifts back to
+    back; without a cooldown a 10-share take would fire every scan and flatten
+    the book just as fast as the old 100-share behaviour.
+    """
+    now = time.monotonic()
+    last = _REBALANCE_LAST.get(snapshot.market_id, 0.0)
+    if last and now - last < config.rebalance_cooldown:
+        return False
+    return True
+
+
 def _inventory_skew(portfolio: PaperPortfolio, snapshot, config: Config) -> float:
     """Shift quotes against the current net position to mean-revert inventory."""
     position = portfolio.open_positions.get(snapshot.market_id)
@@ -451,7 +468,9 @@ def _maker_loop(feed, portfolio, trader, cycles: int, interval: float, config: C
             # Fill the ladder that was resting through this book first: the mid
             # has already moved, so those bids are the ones a taker just hit.
             fills = portfolio.collect_maker_fills(
-                snapshot, budget=_market_budget(portfolio, config))
+                snapshot, budget=_market_budget(portfolio, config),
+                queue_ramp=config.queue_ramp,
+                max_fill_distance=config.max_fill_distance)
             for level in fills:
                 orders.append(_maker_opportunity(snapshot, level, mid_up))
             # Settle the reward clock for the ladder that just rested before it
@@ -472,12 +491,13 @@ def _maker_loop(feed, portfolio, trader, cycles: int, interval: float, config: C
                 take, reason = evaluate_rebalance_take(
                     snapshot, position=position,
                     risk_budget=_market_budget(portfolio, config),
-                    trigger_ratio=config.rebalance_ratio,
+                    trigger_shares=config.rebalance_trigger_shares,
+                    take_shares=config.rebalance_take_shares,
                     min_order_cost=config.minimum_order_cost,
-                    fixed_shares=config.level_shares,
-                )
+                ) if _rebalance_ready(config, snapshot) else (None, "rebalance: cooling down")
                 if take:
                     orders.append(take)
+                    _REBALANCE_LAST[snapshot.market_id] = time.monotonic()
                     log(f"[REBAL TAKE] market={snapshot.market_id} {reason}")
                 else:
                     log(f"[REBAL WAIT] market={snapshot.market_id} {reason}")
@@ -530,6 +550,10 @@ def parse_args() -> argparse.Namespace:
                         help="maker ladder depth per side")
     parser.add_argument("--level-shares", type=float, default=Config.level_shares,
                         help="shares rested on each maker level")
+    parser.add_argument("--queue-ramp", type=float, default=Config.queue_ramp,
+                        help="seconds for a fresh maker order to earn full queue share")
+    parser.add_argument("--replenish-delay", type=float, default=Config.replenish_delay,
+                        help="seconds before a taken maker tick may re-quote")
     parser.add_argument("--assets", default=",".join(Config.assets),
                         help="comma-separated assets, e.g. BTC,ETH,BNB")
     parser.add_argument("--windows", default=",".join(str(w) for w in Config.windows_minutes),
@@ -560,6 +584,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--levels must be >= 1")
     if not math.isfinite(args.level_shares) or args.level_shares <= 0:
         parser.error("--level-shares must be finite and positive")
+    if not math.isfinite(args.queue_ramp) or args.queue_ramp < 0:
+        parser.error("--queue-ramp must be finite and >= 0")
+    if not math.isfinite(args.replenish_delay) or args.replenish_delay < 0:
+        parser.error("--replenish-delay must be finite and >= 0")
     if args.min_scan > args.interval:
         parser.error("--min-scan must not exceed --interval")
     return args
@@ -573,7 +601,8 @@ if __name__ == "__main__":
             data_dir=args.data_dir, assets=args.assets, windows_minutes=args.windows,
             min_scan_interval=args.min_scan, maker_mode=args.mode == "maker",
             quote_offset_cents=args.offset, ladder_levels=args.levels,
-            level_shares=args.level_shares,
+            level_shares=args.level_shares, queue_ramp=args.queue_ramp,
+            replenish_delay=args.replenish_delay,
         )
         run(args.cycles, args.interval, config)
     except KeyboardInterrupt:

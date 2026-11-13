@@ -460,16 +460,17 @@ def evaluate_rebalance_take(
     *,
     position: dict,
     risk_budget: float,
-    trigger_ratio: float = 0.20,
+    trigger_shares: float = 196.0,
+    take_shares: float = 10.0,
     min_order_cost: float = 1.0,
-    fixed_shares: float = 100.0,
 ) -> tuple[Optional[Opportunity], str]:
-    """Take the under-weighted side when inventory drifts too far from flat.
+    """Take the under-weighted side once inventory drifts past the wallet's band.
 
-    This is the wallet's other 5%: it does not only rest bids, it also lifts the
-    offer on the side it is short of so its Up/Down ratio stays near 0.97. Without
-    it the pair cost looks better than reality because the leftover directional
-    exposure is unaccounted for.
+    Measured from the tracked wallet: it lets the net position run to a median of
+    196 shares before acting, then lifts only ~10 shares at a time. Balancing
+    sooner (a 20-share trigger taking 100 at once) flattened the book within
+    seconds, which the wallet never does and which pays the 2% taker fee far too
+    often.
     """
     up = float(position.get("up_quantity", 0.0))
     down = float(position.get("down_quantity", 0.0))
@@ -477,15 +478,15 @@ def evaluate_rebalance_take(
     gross = up + down
     if gross <= 1e-9:
         return None, "rebalance: no inventory"
-    if abs(net) <= max(fixed_shares * trigger_ratio, 1e-9):
-        return None, f"rebalance: net {net:+.0f} inside the band"
+    if abs(net) <= max(trigger_shares, 1e-9):
+        return None, f"rebalance: net {net:+.0f} inside the {trigger_shares:g}-share band"
     # Buy the side we are short of, at its ask, paying the taker fee.
     side = "DOWN" if net > 0 else "UP"
     ask = market.down_ask if side == "DOWN" else market.up_ask
     if not valid_price(ask):
         return None, f"rebalance: no {side} ask to lift"
     all_in = cost_per_net_share(ask, market.fee_rate_bps)
-    quantity = min(abs(net), order_net_quantity(fixed_shares, ask, market.fee_rate_bps,
+    quantity = min(abs(net), order_net_quantity(take_shares, ask, market.fee_rate_bps,
                                                 min_order_cost))
     if quantity <= 1e-9:
         return None, "rebalance: quantity rounds to zero"
