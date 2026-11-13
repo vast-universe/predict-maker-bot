@@ -39,6 +39,7 @@ class RestingLevel:
     price: float
     shares: float
     filled: bool = False
+    placed_at: float = 0.0
 
 
 @dataclass
@@ -76,6 +77,7 @@ class PaperPortfolio:
     account_positions_error: str | None = None
     maker_quotes: dict[str, MakerQuoteState] = field(default_factory=dict)
     maker_fills: list[dict] = field(default_factory=list)
+    replenish_delay: float = 2.0  # seconds a replaced order stays non-live
 
     def __post_init__(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
@@ -260,6 +262,7 @@ class PaperPortfolio:
         *,
         mid_up: float,
         requote_ticks: int = 1,
+        replenish_delay: float = 2.0,
         now: float | None = None,
     ) -> bool:
         """Rest (or re-quote) the two-sided ladder for one market.
@@ -290,14 +293,23 @@ class PaperPortfolio:
                     key = (level.side, round(level.price, precision))
                     if key not in fresh:
                         continue
-                    if level.filled or level.shares + 1e-9 < fresh[key]:
-                        level.filled = False
-                        level.shares = fresh[key]
-                        replenished = True
+                    if not (level.filled or level.shares + 1e-9 < fresh[key]):
+                        continue
+                    # A re-placed order is not instantly live: the venue's speed
+                    # bump delays removal and re-entry. Without a cooldown one
+                    # tick could be eaten and refilled several times a second,
+                    # which pushed the fill rate to 213/min against the wallet's
+                    # 33/min.
+                    if level.placed_at and now - level.placed_at < replenish_delay:
+                        continue
+                    level.filled = False
+                    level.shares = fresh[key]
+                    level.placed_at = now
+                    replenished = True
                 if replenished or state.unfilled():
                     return replenished
         levels = [
-            RestingLevel(side=side, price=level.price, shares=level.shares)
+            RestingLevel(side=side, price=level.price, shares=level.shares, placed_at=now)
             for side, side_levels in ladder.items()
             for level in side_levels
         ]
@@ -311,60 +323,57 @@ class PaperPortfolio:
         return True
 
     def collect_maker_fills(self, snapshot, *, budget: float | None = None) -> list[RestingLevel]:
-        """Fill resting bids whose price the book's ask has traded down to.
+        """Fill a resting bid only when the book at its tick is fully swept.
 
-        A level is only marked filled when the paper ledger can actually pay for
-        it, so the resting book never claims a fill the cash could not fund.
+        Our simulated order is not in the real book, so a depth change at a tick
+        is the whole market trading there, not our share of it. Queue priority
+        decides what we get: a bid one tick behind the best price sits behind
+        every order already resting at that tick, so it only trades once that
+        tick is cleared. Splitting prints proportionally instead let a thin tick
+        hand most of its volume to us and pushed the fill rate to ~280/min
+        against the wallet's 33/min.
         """
         state = self.maker_quotes.get(snapshot.market_id)
         if state is None:
             return []
-        # Fill detection from book depth, not from price movement. The book is
-        # the whole Yes side, so a level's size shrinking means shares traded at
-        # that price while the mid stood still -- exactly how the tracked wallet
-        # gets both sides filled at the same mid and lands a 0.963 pair cost.
-        # Price-crossing rules cannot express that: they only fill once the price
-        # has already moved past the level, which always prices a pair at 1.00.
-        traded = self._traded_shares(state, snapshot)
+        traded, previous_depth = self._traded_shares(state, snapshot)
         precision = max(0, int(getattr(snapshot, "decimal_precision", 3)))
         committed = float((self.open_positions.get(snapshot.market_id) or {}).get("cost", 0.0))
+        now_mono = time.monotonic()
         fills = []
         for level in state.unfilled():
-            side_traded = traded.get(level.side, {})
-            if not side_traded:
+            tick = round(level.price, precision)
+            if previous_depth.get(level.side, {}).get(tick, 0.0) <= 1e-9:
+                # Nothing was resting ahead of us at this tick to be cleared.
                 continue
-            # Only a trade at our own tick can take our bid: a print one tick
-            # away does not cross it. Taking every level at or below the deepest
-            # print would fill the whole ladder from a single small trade.
-            traded_at_level = side_traded.get(round(level.price, precision), 0.0)
-            if traded_at_level <= 1e-9:
+            if level.placed_at and now_mono - level.placed_at < self.replenish_delay:
                 continue
-            # Assume we are somewhere in the queue at that price, so our fill is
-            # capped by the shares that actually traded there.
-            quantity = min(level.shares, traded_at_level)
+            swept = self._tick_swept(state, level.side, tick, snapshot, precision)
+            if not swept:
+                continue
+            quantity = level.shares
             cost = quantity * level.price
             if cost > self.cash + 1e-9:
                 continue
             if budget is not None and committed + cost > budget + 1e-9:
                 continue
-            if quantity + 1e-9 >= level.shares:
-                level.filled = True
-            else:
-                level.shares -= quantity
+            level.filled = True
             committed += cost
             fills.append(RestingLevel(side=level.side, price=level.price, shares=quantity))
         return fills
 
-    def _traded_shares(self, state: MakerQuoteState, snapshot) -> dict[str, dict[float, float]]:
+    def _traded_shares(self, state: MakerQuoteState, snapshot) -> tuple[dict, dict]:
         """Shares that traded per price level since the previous book snapshot.
 
         Down-side levels are derived from the Yes book: a Down bid at p is a Yes
-        ask at 1-p, so Down depth is read off the mirrored Yes side.
+        ask at 1-p, so Down depth is read off the mirrored Yes side. Returns the
+        traded amounts and the depth that was standing before this snapshot.
         """
         precision = max(0, int(getattr(snapshot, "decimal_precision", 3)))
         total_ticks = 10 ** precision
         books = {"UP": snapshot.up_bids, "DOWN": snapshot.up_asks}
         traded: dict[str, dict[float, float]] = {}
+        previous_depth: dict[str, dict[float, float]] = {}
         for side, levels in books.items():
             current: dict[float, float] = {}
             for price, size in levels or ():
@@ -373,6 +382,7 @@ class PaperPortfolio:
                     ticks = total_ticks - ticks
                 current[round(ticks / total_ticks, precision)] = size
             previous = state.last_bids if side == "UP" else state.last_asks
+            previous_depth[side] = dict(previous)
             if previous:
                 for price, before in previous.items():
                     after = current.get(price, 0.0)
@@ -382,7 +392,25 @@ class PaperPortfolio:
                 state.last_bids = current
             else:
                 state.last_asks = current
-        return traded
+        return traded, previous_depth
+
+    def _tick_swept(self, state: MakerQuoteState, side: str, tick: float,
+                    snapshot, precision: int) -> bool:
+        """True when every share resting at ``tick`` has traded away.
+
+        A tick counts as cleared when it is gone from the current book, or when
+        the best bid has fallen below it: either way nothing is left in front of
+        our order at that price.
+        """
+        if side == "UP":
+            current = state.last_bids
+            best = snapshot.up_bid
+        else:
+            current = state.last_asks
+            best = snapshot.down_bid
+        if current.get(tick, 0.0) <= 1e-9:
+            return True
+        return best is not None and float(best) < tick - 1e-12
 
     def accrue_maker_rewards(
         self,

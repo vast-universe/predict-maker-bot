@@ -463,6 +463,7 @@ def _maker_loop(feed, portfolio, trader, cycles: int, interval: float, config: C
             )
             requoted = portfolio.sync_maker_quotes(
                 snapshot, ladder, mid_up=mid_up, requote_ticks=config.requote_ticks,
+                replenish_delay=config.replenish_delay,
             )
             # Balance inventory by taking the side we are short of, like the
             # wallet's aggressive fills, so the Up/Down ratio stays near 0.97.

@@ -1,0 +1,8 @@
+{
+  "cash": 10000.0,
+  "total_cost": 0.0,
+  "filled_trades": 0,
+  "traded_market_ids": [],
+  "open_positions": {},
+  "realized_pnl": 0.0
+}
