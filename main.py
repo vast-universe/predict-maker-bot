@@ -16,6 +16,7 @@ from strategy import (
     evaluate_market,
     evaluate_rebalance,
     hedge_reserve,
+    evaluate_rebalance_take,
     mid_up_price,
     quote_ladder,
 )
@@ -448,6 +449,22 @@ def _maker_loop(feed, portfolio, trader, cycles: int, interval: float, config: C
             requoted = portfolio.sync_maker_quotes(
                 snapshot, ladder, mid_up=mid_up, requote_ticks=config.requote_ticks,
             )
+            # Balance inventory by taking the side we are short of, like the
+            # wallet's aggressive fills, so the Up/Down ratio stays near 0.97.
+            position = portfolio.open_positions.get(snapshot.market_id)
+            if position:
+                take, reason = evaluate_rebalance_take(
+                    snapshot, position=position,
+                    risk_budget=min(config.maker_market_budget, portfolio.cash),
+                    trigger_ratio=config.rebalance_ratio,
+                    min_order_cost=config.minimum_order_cost,
+                    fixed_shares=config.level_shares,
+                )
+                if take:
+                    orders.append(take)
+                    log(f"[REBAL TAKE] market={snapshot.market_id} {reason}")
+                else:
+                    log(f"[REBAL WAIT] market={snapshot.market_id} {reason}")
             portfolio.accrue_maker_rewards(
                 snapshot,
                 spread_threshold=config.reward_spread_threshold,

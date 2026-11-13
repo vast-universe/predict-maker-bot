@@ -51,6 +51,10 @@ class Config:
     # Measured: fills at 0.01/0.02 exist but are far rarer than mid prices, so the
     # ladder shrinks (not disappears) at extreme prices where the 2% taker fee and
     # the near-total loss risk dominate the tiny absolute edge.
+    # The wallet rebalances by taking: 5% of its fills are aggressive buys on the
+    # under-weighted side, which keeps its Up/Down ratio near 0.97.
+    rebalance_ratio: float = 0.20   # act once |net| exceeds this share of one side
+    rebalance_max_fee_bps: float = 200.0
     low_price_shrink_below: float = 0.05
     low_price_shrink_factor: float = 0.3
     reward_spread_threshold: float = 0.06

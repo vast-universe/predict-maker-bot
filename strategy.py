@@ -510,3 +510,56 @@ def maker_fill_price(level: QuoteLevel, best_ask: Optional[float]) -> Optional[f
     if float(best_ask) <= float(level.price) + 1e-12:
         return float(level.price)
     return None
+
+
+def evaluate_rebalance_take(
+    market: MarketSnapshot,
+    *,
+    position: dict,
+    risk_budget: float,
+    trigger_ratio: float = 0.20,
+    min_order_cost: float = 1.0,
+    fixed_shares: float = 100.0,
+) -> tuple[Optional[Opportunity], str]:
+    """Take the under-weighted side when inventory drifts too far from flat.
+
+    This is the wallet's other 5%: it does not only rest bids, it also lifts the
+    offer on the side it is short of so its Up/Down ratio stays near 0.97. Without
+    it the pair cost looks better than reality because the leftover directional
+    exposure is unaccounted for.
+    """
+    up = float(position.get("up_quantity", 0.0))
+    down = float(position.get("down_quantity", 0.0))
+    net = up - down
+    gross = up + down
+    if gross <= 1e-9:
+        return None, "rebalance: no inventory"
+    if abs(net) <= max(fixed_shares * trigger_ratio, 1e-9):
+        return None, f"rebalance: net {net:+.0f} inside the band"
+    # Buy the side we are short of, at its ask, paying the taker fee.
+    side = "DOWN" if net > 0 else "UP"
+    ask = market.down_ask if side == "DOWN" else market.up_ask
+    if not valid_price(ask):
+        return None, f"rebalance: no {side} ask to lift"
+    all_in = cost_per_net_share(ask, market.fee_rate_bps)
+    quantity = min(abs(net), order_net_quantity(fixed_shares, ask, market.fee_rate_bps,
+                                                min_order_cost))
+    if quantity <= 1e-9:
+        return None, "rebalance: quantity rounds to zero"
+    cost = quantity * all_in
+    if cost > risk_budget + 1e-9:
+        return None, f"rebalance: ${cost:.2f} exceeds budget ${risk_budget:.2f}"
+    return Opportunity(
+        market=market, side=side, quantity=quantity, ask=ask,
+        fair_probability=0.5, fee_per_share=all_in - ask, cost_per_share=all_in,
+        expected_edge_per_share=0.0, lead_bps=_lead_bps(market),
+        up_ask=market.up_ask if side == "UP" else None,
+        down_ask=market.down_ask if side == "DOWN" else None,
+        up_cost_per_share=all_in if side == "UP" else 0.0,
+        down_cost_per_share=all_in if side == "DOWN" else 0.0,
+        up_order_quantity=gross_quantity_for_net(quantity, ask, market.fee_rate_bps)
+        if side == "UP" else 0.0,
+        down_order_quantity=gross_quantity_for_net(quantity, ask, market.fee_rate_bps)
+        if side == "DOWN" else 0.0,
+        strategy="rebal",
+    ), f"qualifies: take {side} {quantity:g} to flatten net {net:+.0f}"
