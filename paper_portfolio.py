@@ -1,0 +1,444 @@
+import csv
+import json
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+
+from strategy import Opportunity, unhedged_cost_after_buy
+from markets import valid_price
+
+
+LOG_FIELDS = [
+    "timestamp", "market_id", "market_title", "asset", "window_minutes", "side", "quantity",
+    "up_ask", "down_ask", "ask", "fair_probability", "fee_per_share", "cost",
+    "up_cost_per_share", "down_cost_per_share", "up_order_quantity", "down_order_quantity",
+    "expected_edge", "lead_bps", "settled", "winner", "payout", "realized_pnl",
+]
+
+
+def _money(value: float) -> str:
+    """Format a USDT amount as the summary shows it, e.g. $388.10 / -$12.34."""
+    if value < 0:
+        return f"-${abs(value):.2f}"
+    return f"${value:.2f}"
+
+
+def _signed_money(value: float) -> str:
+    """Format a P&L amount with an explicit sign, e.g. +$0.48 / -$1.06."""
+    if value < 0:
+        return f"-${abs(value):.2f}"
+    return f"+${value:.2f}"
+
+
+@dataclass
+class PaperPortfolio:
+    cash: float
+    data_dir: Path
+    source: str = "predict"
+    total_cost: float = 0.0
+    filled_trades: int = 0
+    traded_market_ids: set[str] = field(default_factory=set)
+    open_positions: dict[str, dict] = field(default_factory=dict)
+    realized_pnl: float = 0.0
+    market_marks: dict[str, dict[str, float | None]] = field(default_factory=dict)
+    account_positions: list[dict] | None = None
+    account_positions_error: str | None = None
+
+    def __post_init__(self) -> None:
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        self.log_path = self.data_dir / "pnl_log.csv"
+        self.summary_path = self.data_dir / "pnl_summary.txt"
+        self.state_path = self.data_dir / "portfolio.json"
+        if self.state_path.exists():
+            state = json.loads(self.state_path.read_text(encoding="utf-8"))
+            self.cash = float(state["cash"])
+            self.total_cost = float(state.get("total_cost", 0.0))
+            self.filled_trades = int(state.get("filled_trades", state.get("filled_pairs", 0)))
+            self.traded_market_ids.update(state.get("traded_market_ids", []))
+            self.open_positions.update(state.get("open_positions", {}))
+            self.realized_pnl = float(state.get("realized_pnl", 0.0))
+        self._ensure_log_schema()
+        with self.log_path.open("r", newline="", encoding="utf-8") as file:
+            rows = list(csv.DictReader(file))
+            for row in rows:
+                market_id = row.get("market_id")
+                if market_id:
+                    self.traded_market_ids.add(market_id)
+        self._normalize_open_positions(rows)
+        # Persist the opening state right away: otherwise a run with no fills
+        # leaves no portfolio.json, and the ledger looks like it lost its state.
+        if not self.state_path.exists():
+            self._save_state()
+
+    def _ensure_log_schema(self) -> None:
+        if not self.log_path.exists():
+            with self.log_path.open("w", newline="", encoding="utf-8") as file:
+                csv.writer(file).writerow(LOG_FIELDS)
+            return
+
+        with self.log_path.open("r", newline="", encoding="utf-8") as file:
+            reader = csv.DictReader(file)
+            old_fields = reader.fieldnames or []
+            if old_fields == LOG_FIELDS:
+                return
+            old_rows = list(reader)
+
+        migrated_rows = []
+        for row in old_rows:
+            migrated = {field: row.get(field, "") for field in LOG_FIELDS}
+            if not migrated.get("side") and row.get("up_ask") and row.get("down_ask"):
+                migrated["side"] = "PAIR"
+            migrated_rows.append(migrated)
+
+        with self.log_path.open("w", newline="", encoding="utf-8") as file:
+            writer = csv.DictWriter(file, fieldnames=LOG_FIELDS)
+            writer.writeheader()
+            writer.writerows(migrated_rows)
+
+    def record_trade(self, opportunity: Opportunity) -> float:
+        market = opportunity.market
+        position = self.open_positions.get(market.market_id)
+        if market.market_id in self.traded_market_ids:
+            # Open markets may receive repeated fixed-size orders. Same-side
+            # additions are allowed; opposite-side orders may only reduce the
+            # current net position and cannot flip it.
+            if not position or opportunity.side == "PAIR":
+                return 0.0
+            net_up_quantity = (
+                float(position.get("up_quantity", 0.0))
+                - float(position.get("down_quantity", 0.0))
+            )
+            if abs(net_up_quantity) > 1e-9:
+                held_side = "UP" if net_up_quantity > 0 else "DOWN"
+                if opportunity.side != held_side and opportunity.quantity > abs(net_up_quantity) + 1e-6:
+                    return 0.0
+        cost = opportunity.quantity * opportunity.cost_per_share
+        if cost > self.cash + 1e-9:
+            return 0.0
+        self.cash -= cost
+        self.total_cost += cost
+        self.filled_trades += 1
+        self.traded_market_ids.add(market.market_id)
+        position = self.open_positions.setdefault(
+            market.market_id,
+            {"up_quantity": 0.0, "down_quantity": 0.0, "cost": 0.0,
+             "up_cost": 0.0, "down_cost": 0.0,
+             "asset": market.asset, "window_minutes": market.window_minutes},
+        )
+        position["unhedged_cost"] = unhedged_cost_after_buy(
+            position, opportunity.side, opportunity.quantity, cost
+        )
+        if opportunity.side in ("UP", "PAIR"):
+            position["up_quantity"] = float(position.get("up_quantity", 0.0)) + opportunity.quantity
+            position["up_cost"] = float(position.get("up_cost", 0.0)) + (
+                opportunity.quantity * (
+                    opportunity.up_cost_per_share or opportunity.cost_per_share
+                )
+            )
+        if opportunity.side in ("DOWN", "PAIR"):
+            position["down_quantity"] = float(position.get("down_quantity", 0.0)) + opportunity.quantity
+            position["down_cost"] = float(position.get("down_cost", 0.0)) + (
+                opportunity.quantity * (
+                    opportunity.down_cost_per_share or opportunity.cost_per_share
+                )
+            )
+        position["cost"] = float(position.get("cost", 0.0)) + cost
+        with self.log_path.open("a", newline="", encoding="utf-8") as file:
+            csv.writer(file).writerow(
+                [market.observed_at, market.market_id, market.market_title or "",
+                 market.asset, market.window_minutes,
+                 opportunity.side, opportunity.quantity,
+                 opportunity.up_ask if opportunity.up_ask is not None else "",
+                 opportunity.down_ask if opportunity.down_ask is not None else "",
+                 opportunity.ask, round(opportunity.fair_probability, 6),
+                 round(opportunity.fee_per_share, 6), round(cost, 4),
+                 round(opportunity.up_cost_per_share, 8),
+                 round(opportunity.down_cost_per_share, 8),
+                 round(opportunity.up_order_quantity, 4),
+                 round(opportunity.down_order_quantity, 4),
+                 round(opportunity.expected_edge_per_share * opportunity.quantity, 4),
+                 round(opportunity.lead_bps, 3), "", "", "", ""]
+            )
+        self.state_path.write_text(
+            json.dumps(
+                {"cash": round(self.cash, 4), "total_cost": round(self.total_cost, 4),
+                 "filled_trades": self.filled_trades,
+                 "traded_market_ids": sorted(self.traded_market_ids),
+                 "open_positions": self.open_positions,
+                 "realized_pnl": round(self.realized_pnl, 4)},
+                indent=2,
+            ) + "\n",
+            encoding="utf-8",
+        )
+        self.write_summary()
+        return cost
+
+    def record_sell(self, opportunity: Opportunity) -> float:
+        """Trim the unmatched leg of a hedged position and return the proceeds."""
+        market = opportunity.market
+        position = self.open_positions.get(market.market_id)
+        if position is None or not opportunity.sell:
+            return 0.0
+        side = opportunity.side
+        quantity_key = "up_quantity" if side == "UP" else "down_quantity"
+        cost_key = "up_cost" if side == "UP" else "down_cost"
+        held_quantity = float(position.get(quantity_key, 0.0))
+        quantity = min(float(opportunity.quantity), held_quantity)
+        if quantity <= 1e-9:
+            return 0.0
+        held_cost = float(position.get(cost_key, 0.0))
+        average_cost = held_cost / held_quantity if held_quantity else 0.0
+        proceeds = quantity * opportunity.ask
+        self.cash += proceeds
+        self.realized_pnl += quantity * (opportunity.ask - average_cost)
+        self.filled_trades += 1
+        position[quantity_key] = held_quantity - quantity
+        position[cost_key] = max(0.0, held_cost - quantity * average_cost)
+        position["cost"] = max(0.0, float(position.get("cost", 0.0)) - quantity * average_cost)
+        # Trimming exactly the unmatched leg leaves the two sides balanced.
+        position["unhedged_cost"] = 0.0
+        with self.log_path.open("a", newline="", encoding="utf-8") as file:
+            csv.writer(file).writerow(
+                [market.observed_at, market.market_id, market.market_title or "",
+                 market.asset, market.window_minutes, f"SELL_{side}", quantity,
+                 market.up_ask if market.up_ask is not None else "",
+                 market.down_ask if market.down_ask is not None else "",
+                 opportunity.ask, 0.0, 0.0, round(-proceeds, 6),
+                 0.0, 0.0, quantity, quantity,
+                 round(opportunity.expected_edge_per_share * quantity, 4),
+                 round(opportunity.lead_bps, 3), "", "", "", ""]
+            )
+        self._save_state()
+        self.write_summary()
+        return proceeds
+
+    @property
+    def open_exposure(self) -> float:
+        return sum(float(position["cost"]) for position in self.open_positions.values())
+
+    def update_market_marks(self, snapshots) -> None:
+        for snapshot in snapshots:
+            self.market_marks[snapshot.market_id] = {
+                "up_bid": 1.0 - snapshot.down_ask if valid_price(snapshot.down_ask) else None,
+                "down_bid": 1.0 - snapshot.up_ask if valid_price(snapshot.up_ask) else None,
+                "fee_rate_bps": snapshot.fee_rate_bps,
+            }
+
+    def update_account_positions(self, positions: list[dict]) -> None:
+        self.account_positions = positions
+        self.account_positions_error = None
+
+    def set_account_positions_error(self, error: str) -> None:
+        self.account_positions_error = error
+
+    def has_opposing_position(self, market_id: str, side: str) -> bool:
+        position = self.open_positions.get(market_id)
+        if not position or side == "PAIR":
+            return False
+        net = float(position.get("up_quantity", 0.0)) - float(position.get("down_quantity", 0.0))
+        return (side == "DOWN" and net > 1e-9) or (side == "UP" and net < -1e-9)
+
+    def settle_trade(self, market_id: str, winner: str) -> float:
+        position = self.open_positions.get(market_id)
+        if position is None:
+            return 0.0
+        up_quantity = float(position.get("up_quantity", 0.0))
+        down_quantity = float(position.get("down_quantity", 0.0))
+        payout = (
+            up_quantity if winner == "UP" else down_quantity if winner == "DOWN"
+            else (up_quantity + down_quantity) * 0.5 if winner == "TIE" else 0.0
+        )
+        cost = float(position["cost"])
+        pnl = payout - cost
+        self.cash += payout
+        self.total_cost = max(0.0, self.total_cost - cost)
+        self.realized_pnl += pnl
+        del self.open_positions[market_id]
+        self._update_ledger_settlement(market_id, winner, payout, pnl)
+        self._save_state()
+        self.write_summary()
+        return pnl
+
+    def _update_ledger_settlement(self, market_id: str, winner: str, payout: float, pnl: float) -> None:
+        with self.log_path.open("r", newline="", encoding="utf-8") as file:
+            reader = csv.DictReader(file)
+            rows = list(reader)
+        for row in rows:
+            if row.get("market_id") == market_id:
+                row["settled"] = "true"
+                row["winner"] = winner
+                quantity = float(row.get("quantity") or 0.0)
+                side = row.get("side")
+                if side in ("SELL_UP", "SELL_DOWN"):
+                    # Proceeds were credited when the trim filled; no payout now.
+                    row_payout = 0.0
+                elif side == "PAIR":
+                    row_payout = quantity
+                elif winner == side:
+                    row_payout = quantity
+                elif winner == "TIE":
+                    row_payout = quantity * 0.5
+                else:
+                    row_payout = 0.0
+                row_cost = float(row.get("cost") or 0.0)
+                row["payout"] = f"{row_payout:.4f}"
+                row["realized_pnl"] = f"{row_payout - row_cost:.4f}"
+        with self.log_path.open("w", newline="", encoding="utf-8") as file:
+            writer = csv.DictWriter(file, fieldnames=LOG_FIELDS)
+            writer.writeheader()
+            writer.writerows(rows)
+
+    def _save_state(self) -> None:
+        self.state_path.write_text(
+            json.dumps(
+                {"cash": round(self.cash, 4), "total_cost": round(self.total_cost, 4),
+                 "filled_trades": self.filled_trades,
+                 "traded_market_ids": sorted(self.traded_market_ids),
+                 "open_positions": self.open_positions,
+                 "realized_pnl": round(self.realized_pnl, 4)},
+                indent=2,
+            ) + "\n",
+            encoding="utf-8",
+        )
+
+    def _normalize_open_positions(self, rows: list[dict] | None = None) -> None:
+        logged_side_costs: dict[str, dict[str, float]] = {}
+        replayed_positions: dict[str, dict] = {}
+        for row in rows or []:
+            market_id = row.get("market_id")
+            if not market_id:
+                continue
+            side_costs = logged_side_costs.setdefault(market_id, {"up_cost": 0.0, "down_cost": 0.0})
+            quantity = float(row.get("quantity") or 0.0)
+            side = row.get("side")
+            if side in ("UP", "DOWN"):
+                replayed = replayed_positions.setdefault(
+                    market_id, {"up_quantity": 0.0, "down_quantity": 0.0, "unhedged_cost": 0.0}
+                )
+                replayed["unhedged_cost"] = unhedged_cost_after_buy(
+                    replayed, side, quantity, float(row.get("cost") or 0.0)
+                )
+                key = "up_quantity" if side == "UP" else "down_quantity"
+                replayed[key] += quantity
+            if side == "UP":
+                side_costs["up_cost"] += float(row.get("cost") or 0.0)
+            elif side == "DOWN":
+                side_costs["down_cost"] += float(row.get("cost") or 0.0)
+            elif side == "PAIR":
+                up_cost_per_share = float(row.get("up_cost_per_share") or 0.0)
+                down_cost_per_share = float(row.get("down_cost_per_share") or 0.0)
+                if up_cost_per_share > 0 and down_cost_per_share > 0:
+                    side_costs["up_cost"] += quantity * up_cost_per_share
+                    side_costs["down_cost"] += quantity * down_cost_per_share
+                else:
+                    total = float(row.get("cost") or 0.0)
+                    side_costs["up_cost"] += total / 2.0
+                    side_costs["down_cost"] += total / 2.0
+
+        for market_id, position in list(self.open_positions.items()):
+            if "up_quantity" in position or "down_quantity" in position:
+                normalized = position
+            else:
+                side = position.get("side")
+                quantity = float(position.get("quantity", 0.0))
+                normalized = {
+                    "up_quantity": quantity if side in ("UP", "PAIR") else 0.0,
+                    "down_quantity": quantity if side in ("DOWN", "PAIR") else 0.0,
+                    "cost": float(position.get("cost", 0.0)),
+                    "asset": position.get("asset", ""),
+                    "window_minutes": position.get("window_minutes", 0),
+                }
+                self.open_positions[market_id] = normalized
+
+            quantities = {
+                "up_quantity": float(normalized.get("up_quantity", 0.0)),
+                "down_quantity": float(normalized.get("down_quantity", 0.0)),
+            }
+            side_costs = logged_side_costs.get(market_id, {})
+            total_quantity = quantities["up_quantity"] + quantities["down_quantity"]
+            total_cost = float(normalized.get("cost", 0.0))
+            for side in ("up", "down"):
+                key = f"{side}_cost"
+                if key in normalized:
+                    continue
+                logged_cost = float(side_costs.get(key, 0.0))
+                if logged_cost > 0:
+                    normalized[key] = logged_cost
+                elif total_quantity > 0:
+                    normalized[key] = total_cost * quantities[f"{side}_quantity"] / total_quantity
+                else:
+                    normalized[key] = 0.0
+            if "unhedged_cost" not in normalized:
+                replayed = replayed_positions.get(market_id)
+                net_up = quantities["up_quantity"] - quantities["down_quantity"]
+                if replayed and abs(
+                    replayed["up_quantity"] - replayed["down_quantity"] - net_up
+                ) <= 1e-6:
+                    normalized["unhedged_cost"] = replayed["unhedged_cost"]
+                else:
+                    side = "up" if net_up > 0 else "down"
+                    side_quantity = quantities[f"{side}_quantity"]
+                    normalized["unhedged_cost"] = (
+                        abs(net_up) * normalized[f"{side}_cost"] / side_quantity
+                        if side_quantity > 0 else 0.0
+                    )
+
+    def write_summary(self) -> None:
+        with self.log_path.open("r", newline="", encoding="utf-8") as file:
+            rows = list(csv.DictReader(file))
+        settled = [row for row in rows if (row.get("settled") or "").lower() == "true"]
+        total_cost = sum(float(row.get("cost") or 0.0) for row in settled)
+        total_payout = sum(float(row.get("payout") or 0.0) for row in settled)
+
+        results_by_market: dict[str, dict] = {}
+        for row in settled:
+            market_id = row.get("market_id", "")
+            result = results_by_market.setdefault(
+                market_id,
+                {"row": row, "pnl": 0.0, "window": int(row.get("window_minutes") or 0)},
+            )
+            result["pnl"] += float(row.get("realized_pnl") or 0.0)
+
+        # Show a block per window that actually has settled or open inventory,
+        # instead of a fixed 5/15 pair that a single-window run never fills.
+        window_ids = {result["window"] for result in results_by_market.values()}
+        window_ids |= {
+            int(position.get("window_minutes") or 0)
+            for position in self.open_positions.values()
+        }
+        windows = sorted(window for window in window_ids if window > 0)
+        lines = [
+            f"# P&L Summary — {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}",
+            "",
+            f"Settled markets: {len(results_by_market)}",
+            f"Total cost:     ${total_cost:.2f}",
+            f"Total payout: ${total_payout:.2f}",
+            f"Realized P&L: {_money(total_payout - total_cost)}",
+            "",
+        ]
+        for window in windows:
+            group = [row for row in settled if int(row.get("window_minutes") or 0) == window]
+            group_cost = sum(float(row.get("cost") or 0.0) for row in group)
+            group_payout = sum(float(row.get("payout") or 0.0) for row in group)
+            group_pnl = group_payout - group_cost
+            lines.append(f"--- {window}-min markets ---")
+            lines.append(
+                f"Count: {len({row.get('market_id') for row in group})} | "
+                f"Cost: ${group_cost:.2f} | Payout: ${group_payout:.2f} | "
+                f"P&L: ${group_pnl:+.2f}"
+            )
+            window_results = [
+                result for result in results_by_market.values() if result["window"] == window
+            ]
+            for result in window_results:
+                row = result["row"]
+                title = row.get("market_title") or (
+                    f"{row.get('asset', 'Market')} Up or Down - "
+                    f"{row.get('window_minutes', '?')}m ({row.get('market_id', '')})"
+                )
+                winner = row.get("winner") or "Unknown"
+                lines.append(f"{title} → {winner}  {_signed_money(result['pnl'])}")
+            lines.append("")
+        while lines and lines[-1] == "":
+            lines.pop()
+        self.summary_path.write_text("\n".join(lines) + "\n", encoding="utf-8")

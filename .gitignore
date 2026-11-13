@@ -1,0 +1,8 @@
+.env
+__pycache__/
+*.py[cod]
+.venv/
+paper_data/*.csv
+paper_data/*.json
+paper_data/*.txt
+!paper_data/.gitkeep

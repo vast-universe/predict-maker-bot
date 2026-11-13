@@ -1,0 +1,2 @@
+predict-sdk==0.0.22
+websockets==15.0.1
