@@ -620,6 +620,93 @@ class PaperPortfolio:
                         if side_quantity > 0 else 0.0
                     )
 
+
+    def position_valuation(self) -> list[dict]:
+        """Per-market inventory with side averages and the unrealised P&L.
+
+        A mark is only computed for a side whose bid is quoted: without a real
+        bid the position is reported as unmatched rather than marked at a price
+        nobody is showing.
+        """
+        out = []
+        for market_id, position in self.open_positions.items():
+            up = float(position.get("up_quantity", 0.0))
+            down = float(position.get("down_quantity", 0.0))
+            up_cost = float(position.get("up_cost", 0.0))
+            down_cost = float(position.get("down_cost", 0.0))
+            cost = float(position.get("cost", 0.0))
+            mark = self.market_marks.get(market_id) or {}
+            up_bid, down_bid = mark.get("up_bid"), mark.get("down_bid")
+            value = None
+            if (up <= 1e-9 or valid_price(up_bid)) and (down <= 1e-9 or valid_price(down_bid)):
+                value = (up * float(up_bid or 0.0)) + (down * float(down_bid or 0.0))
+            out.append({
+                "market_id": market_id,
+                "asset": position.get("asset", ""),
+                "window_minutes": int(position.get("window_minutes") or 0),
+                "up_quantity": up,
+                "up_average": up_cost / up if up > 1e-9 else None,
+                "up_bid": up_bid,
+                "down_quantity": down,
+                "down_average": down_cost / down if down > 1e-9 else None,
+                "down_bid": down_bid,
+                "cost": cost,
+                "value": value,
+                "unrealized": (value - cost) if value is not None else None,
+                "net": up - down,
+            })
+        return out
+
+    def _summary_position_lines(self) -> list[str]:
+        """The open-inventory block: size, average price, mark and unrealised P&L."""
+        positions = self.position_valuation()
+        if not positions:
+            return []
+        lines = ["", "--- positions ---"]
+        total_cost = total_value = 0.0
+        marked_all = True
+        for row in positions:
+            lines.append(
+                f"{row['asset']} {row['window_minutes']}m market={row['market_id']}"
+            )
+            for side in ("up", "down"):
+                quantity = row[f"{side}_quantity"]
+                if quantity <= 1e-9:
+                    continue
+                average = row[f"{side}_average"]
+                bid = row[f"{side}_bid"]
+                cost = quantity * average
+                if valid_price(bid):
+                    value = quantity * float(bid)
+                    lines.append(
+                        f"  {side.title():4s} {quantity:9.1f} shares @ {average:.4f} "
+                        f"| bid {float(bid):.3f} | cost ${cost:.2f} | value ${value:.2f} "
+                        f"| {_signed_money(value - cost)}"
+                    )
+                else:
+                    lines.append(
+                        f"  {side.title():4s} {quantity:9.1f} shares @ {average:.4f} "
+                        f"| bid n/a | cost ${cost:.2f} | value n/a"
+                    )
+            unrealized = row["unrealized"]
+            if unrealized is None:
+                marked_all = False
+                lines.append("  Mark: unavailable (missing bid)")
+            else:
+                lines.append(
+                    f"  Value ${row['value']:.2f} | Unrealized {_signed_money(unrealized)}"
+                )
+            lines.append(f"  Net {row['net']:+.1f} shares")
+            total_cost += row["cost"]
+            if row["value"] is not None:
+                total_value += row["value"]
+        if marked_all and positions:
+            lines.append(
+                f"Open total: cost ${total_cost:.2f} | value ${total_value:.2f} "
+                f"| unrealized {_signed_money(total_value - total_cost)}"
+            )
+        return lines
+
     def write_summary(self) -> None:
         with self.log_path.open("r", newline="", encoding="utf-8") as file:
             rows = list(csv.DictReader(file))
@@ -643,6 +730,7 @@ class PaperPortfolio:
             int(position.get("window_minutes") or 0)
             for position in self.open_positions.values()
         }
+        position_lines = self._summary_position_lines()
         pair_stats = self.maker_pair_stats()
         maker_lines = []
         if pair_stats["pairs"] or pair_stats["unmatched"]:
@@ -667,7 +755,7 @@ class PaperPortfolio:
             f"Total cost:     ${total_cost:.2f}",
             f"Total payout: ${total_payout:.2f}",
             f"Realized P&L: {_money(total_payout - total_cost)}",
-        ] + maker_lines + [""]
+        ] + position_lines + maker_lines + [""]
         for window in windows:
             group = [row for row in settled if int(row.get("window_minutes") or 0) == window]
             group_cost = sum(float(row.get("cost") or 0.0) for row in group)
