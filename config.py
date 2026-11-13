@@ -46,7 +46,7 @@ class Config:
     ladder_step_cents: float = 1.0
     level_shares: float = 100.0
     requote_ticks: int = 1
-    replenish_delay: float = 2.0  # seconds before a taken tick may re-quote
+    replenish_delay: float = 8.0  # wallet refills a taken tick after ~8s (median)
     skew_cents_max: float = 0.0  # measured wallet quotes both sides symmetrically
     # None means a single market may use any amount, bounded only by free cash.
     maker_market_budget: Optional[float] = None

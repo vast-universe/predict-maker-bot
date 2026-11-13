@@ -1,1 +1,0 @@
-timestamp,market_id,market_title,asset,window_minutes,side,quantity,up_ask,down_ask,ask,fair_probability,fee_per_share,cost,up_cost_per_share,down_cost_per_share,up_order_quantity,down_order_quantity,expected_edge,lead_bps,settled,winner,payout,realized_pnl

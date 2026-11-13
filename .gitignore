@@ -2,7 +2,6 @@
 __pycache__/
 *.py[cod]
 .venv/
-paper_data/*.csv
-paper_data/*.json
-paper_data/*.txt
+# Paper ledgers are runtime state; any --data-dir variant is ignored
+paper_data*/
 !paper_data/.gitkeep

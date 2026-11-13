@@ -77,7 +77,7 @@ class PaperPortfolio:
     account_positions_error: str | None = None
     maker_quotes: dict[str, MakerQuoteState] = field(default_factory=dict)
     maker_fills: list[dict] = field(default_factory=list)
-    replenish_delay: float = 2.0  # seconds a replaced order stays non-live
+    replenish_delay: float = 8.0  # wallet refills a taken tick after ~8s (median)
 
     def __post_init__(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
@@ -262,7 +262,7 @@ class PaperPortfolio:
         *,
         mid_up: float,
         requote_ticks: int = 1,
-        replenish_delay: float = 2.0,
+        replenish_delay: float = 8.0,
         now: float | None = None,
     ) -> bool:
         """Rest (or re-quote) the two-sided ladder for one market.
@@ -308,8 +308,10 @@ class PaperPortfolio:
                     replenished = True
                 if replenished or state.unfilled():
                     return replenished
+        # placed_at stays 0 on a fresh ladder: a newly rested order is live at
+        # once, and only a *replacement* has to wait out the venue's delay.
         levels = [
-            RestingLevel(side=side, price=level.price, shares=level.shares, placed_at=now)
+            RestingLevel(side=side, price=level.price, shares=level.shares)
             for side, side_levels in ladder.items()
             for level in side_levels
         ]
@@ -348,16 +350,29 @@ class PaperPortfolio:
                 continue
             if level.placed_at and now_mono - level.placed_at < self.replenish_delay:
                 continue
-            swept = self._tick_swept(state, level.side, tick, snapshot, precision)
-            if not swept:
+            # Queue share, not sweep-through. We rest at the same tick as other
+            # makers, so a print there is split by queue order rather than only
+            # reaching us once the tick is emptied. Waiting for the tick to clear
+            # makes every fill land after the price has already moved past it,
+            # which turned the pair cost from 0.9658 into 1.0489 and made the
+            # strategy lose money the more it traded.
+            traded_at_level = traded.get(level.side, {}).get(tick, 0.0)
+            if traded_at_level <= 1e-9:
                 continue
-            quantity = level.shares
+            resting_depth = previous_depth.get(level.side, {}).get(tick, 0.0)
+            queue_total = max(resting_depth, 0.0) + level.shares
+            if queue_total <= 1e-9:
+                continue
+            quantity = min(level.shares, traded_at_level * level.shares / queue_total)
             cost = quantity * level.price
             if cost > self.cash + 1e-9:
                 continue
             if budget is not None and committed + cost > budget + 1e-9:
                 continue
-            level.filled = True
+            if quantity + 1e-9 >= level.shares:
+                level.filled = True
+            else:
+                level.shares -= quantity
             committed += cost
             fills.append(RestingLevel(side=level.side, price=level.price, shares=quantity))
         return fills
@@ -393,24 +408,6 @@ class PaperPortfolio:
             else:
                 state.last_asks = current
         return traded, previous_depth
-
-    def _tick_swept(self, state: MakerQuoteState, side: str, tick: float,
-                    snapshot, precision: int) -> bool:
-        """True when every share resting at ``tick`` has traded away.
-
-        A tick counts as cleared when it is gone from the current book, or when
-        the best bid has fallen below it: either way nothing is left in front of
-        our order at that price.
-        """
-        if side == "UP":
-            current = state.last_bids
-            best = snapshot.up_bid
-        else:
-            current = state.last_asks
-            best = snapshot.down_bid
-        if current.get(tick, 0.0) <= 1e-9:
-            return True
-        return best is not None and float(best) < tick - 1e-12
 
     def accrue_maker_rewards(
         self,

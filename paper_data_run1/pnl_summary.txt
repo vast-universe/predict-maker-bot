@@ -1,6 +1,0 @@
-# P&L Summary — 2026-11-13 21:34:55 UTC
-
-Settled markets: 0
-Total cost:     $0.00
-Total payout: $0.00
-Realized P&L: $0.00
