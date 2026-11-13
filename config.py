@@ -26,7 +26,7 @@ _load_env_file()
 class Config:
     assets: tuple[str, ...] = ("BTC",)
     windows_minutes: tuple[int, ...] = (5,)
-    starting_cash: float = 1_000.0
+    starting_cash: float = 10_000.0
     max_order_cost: float = 100.0
     risk_fraction: float = 0.10
     max_exposure_fraction: float = 0.10
@@ -47,7 +47,8 @@ class Config:
     level_shares: float = 100.0
     requote_ticks: int = 1
     skew_cents_max: float = 0.0  # measured wallet quotes both sides symmetrically
-    maker_market_budget: float = 600.0  # 5 levels x 100 shares x ~0.5 on both sides
+    # None means a single market may use any amount, bounded only by free cash.
+    maker_market_budget: Optional[float] = None
     # Measured: fills at 0.01/0.02 exist but are far rarer than mid prices, so the
     # ladder shrinks (not disappears) at extreme prices where the 2% taker fee and
     # the near-total loss risk dominate the tiny absolute edge.

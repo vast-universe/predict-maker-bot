@@ -347,6 +347,18 @@ def _scan_loop(feed, portfolio, trader, cycles: int, interval: float, config: Co
     say(f"Summary written to {portfolio.summary_path}")
 
 
+
+def _market_budget(portfolio: PaperPortfolio, config: Config) -> float:
+    """Cash a single market may commit.
+
+    ``maker_market_budget`` caps it explicitly; when unset the only limit is the
+    free cash, so one round can use the whole bankroll.
+    """
+    if config.maker_market_budget is None:
+        return max(0.0, portfolio.cash)
+    return max(0.0, min(config.maker_market_budget, portfolio.cash))
+
+
 def _inventory_skew(portfolio: PaperPortfolio, snapshot, config: Config) -> float:
     """Shift quotes against the current net position to mean-revert inventory."""
     position = portfolio.open_positions.get(snapshot.market_id)
@@ -439,7 +451,7 @@ def _maker_loop(feed, portfolio, trader, cycles: int, interval: float, config: C
             # Fill the ladder that was resting through this book first: the mid
             # has already moved, so those bids are the ones a taker just hit.
             fills = portfolio.collect_maker_fills(
-                snapshot, budget=config.maker_market_budget)
+                snapshot, budget=_market_budget(portfolio, config))
             for level in fills:
                 orders.append(_maker_opportunity(snapshot, level, mid_up))
             # Settle the reward clock for the ladder that just rested before it
@@ -458,7 +470,7 @@ def _maker_loop(feed, portfolio, trader, cycles: int, interval: float, config: C
             if position:
                 take, reason = evaluate_rebalance_take(
                     snapshot, position=position,
-                    risk_budget=min(config.maker_market_budget, portfolio.cash),
+                    risk_budget=_market_budget(portfolio, config),
                     trigger_ratio=config.rebalance_ratio,
                     min_order_cost=config.minimum_order_cost,
                     fixed_shares=config.level_shares,
