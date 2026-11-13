@@ -54,7 +54,6 @@ class Config:
     # The wallet rebalances by taking: 5% of its fills are aggressive buys on the
     # under-weighted side, which keeps its Up/Down ratio near 0.97.
     rebalance_ratio: float = 0.20   # act once |net| exceeds this share of one side
-    rebalance_max_fee_bps: float = 200.0
     low_price_shrink_below: float = 0.05
     low_price_shrink_factor: float = 0.3
     reward_spread_threshold: float = 0.06
@@ -68,4 +67,3 @@ class Config:
     predict_api_key: Optional[str] = os.getenv("PREDICT_API_KEY") or None
     predict_base_url: str = os.getenv("PREDICT_BASE_URL", "https://api.predict.fun").rstrip("/")
     predict_account_address: Optional[str] = os.getenv("PREDICT_ACCOUNT_ADDRESS") or None
-    privy_wallet_private_key: Optional[str] = os.getenv("PRIVY_WALLET_PRIVATE_KEY") or None

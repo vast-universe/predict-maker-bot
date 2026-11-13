@@ -59,12 +59,6 @@ class MarketSnapshot:
     up_asks: tuple = ()
 
 
-def down_ask_from_yes_bid(yes_bid: float, decimal_precision: int) -> float:
-    """Convert the best Yes bid into the complementary No/Down ask price."""
-    tick = Decimal(1).scaleb(-decimal_precision)
-    return float((Decimal(1) - Decimal(str(yes_bid))).quantize(tick))
-
-
 def _levels(raw) -> tuple:
     """Normalise a book side into ((price, size), ...) with invalid rows dropped."""
     out = []
@@ -279,20 +273,6 @@ class PredictWebSocketFeed:
         return self._precision.get(market_id)
 
     # -------------------------------------------------------------- reads
-    def quotes_ready(self, market_ids: list[str], max_age: float | None = None) -> bool:
-        """True when every market has a quote fresher than ``max_age``."""
-        if not self.store.connected:
-            return False
-        now = time.time()
-        limit = max_age if max_age is not None else self.max_age
-        for market_id in market_ids:
-            quote = self.store.quotes.get(market_id)
-            if quote is None:
-                return False
-            if limit and quote.received_at and now - quote.received_at > limit:
-                return False
-        return True
-
     def quote(self, market_id: str) -> BookQuote | None:
         return self.store.quotes.get(market_id)
 
@@ -418,30 +398,6 @@ class PredictWebSocketFeed:
     async def _close(self) -> None:
         if self._socket is not None:
             await self._socket.close()
-
-    def _handle_sync_put(self, payload: dict, decimal_precision: int | None = None) -> None:
-        """Store one order-book payload without a live socket (tests, REST warm-up)."""
-        payload = dict(payload)
-        market_id = str(payload.get("marketId", ""))
-        payload.setdefault("marketId", market_id)
-        quote = BookQuote.from_orderbook(payload, decimal_precision)
-        quote.market_id = market_id
-        self.store.put_book(quote, payload)
-        self._last_message_at = time.time()
-        self._notify_update()
-
-    def _handle_text(self, raw: str) -> None:
-        """Parse one raw frame with no socket attached (heartbeat stays unsent)."""
-        try:
-            message = json.loads(raw)
-        except json.JSONDecodeError:
-            return
-        if not isinstance(message, dict):
-            return
-        self._last_message_at = time.time()
-        if message.get("topic") == "heartbeat":
-            return
-        self._route(message)
 
     def _route(self, message: dict) -> None:
         self._dispatch(None, message)

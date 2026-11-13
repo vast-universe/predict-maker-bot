@@ -295,15 +295,18 @@ class PaperPortfolio:
                         level.shares = fresh[key]
                         replenished = True
                 if replenished:
-                    state.quoted_at = now
                     return True
         levels = [
             RestingLevel(side=side, price=level.price, shares=level.shares)
             for side, side_levels in ladder.items()
             for level in side_levels
         ]
+        carried = state or MakerQuoteState(market_id=snapshot.market_id, mid_up=mid_up)
         self.maker_quotes[snapshot.market_id] = MakerQuoteState(
             market_id=snapshot.market_id, mid_up=mid_up, levels=levels, quoted_at=now,
+            reward_seconds=carried.reward_seconds,
+            reward_share_seconds=carried.reward_share_seconds,
+            last_bids=carried.last_bids, last_asks=carried.last_asks,
         )
         return True
 
@@ -385,6 +388,9 @@ class PaperPortfolio:
             return
         now = time.monotonic() if now is None else now
         elapsed = max(0.0, now - state.quoted_at) if state.quoted_at else 0.0
+        # Advance the clock here, not in sync_maker_quotes: the ladder is
+        # re-quoted almost every cycle, so resetting it there would leave the
+        # reward interval at zero forever.
         state.quoted_at = now
         if elapsed <= 0:
             return
@@ -468,13 +474,6 @@ class PaperPortfolio:
 
     def set_account_positions_error(self, error: str) -> None:
         self.account_positions_error = error
-
-    def has_opposing_position(self, market_id: str, side: str) -> bool:
-        position = self.open_positions.get(market_id)
-        if not position or side == "PAIR":
-            return False
-        net = float(position.get("up_quantity", 0.0)) - float(position.get("down_quantity", 0.0))
-        return (side == "DOWN" and net > 1e-9) or (side == "UP" and net < -1e-9)
 
     def settle_trade(self, market_id: str, winner: str) -> float:
         position = self.open_positions.get(market_id)
@@ -644,6 +643,22 @@ class PaperPortfolio:
             int(position.get("window_minutes") or 0)
             for position in self.open_positions.values()
         }
+        pair_stats = self.maker_pair_stats()
+        maker_lines = []
+        if pair_stats["pairs"] or pair_stats["unmatched"]:
+            pair_cost = pair_stats["pair_cost"]
+            maker_lines = [
+                "",
+                "--- maker ---",
+                f"Matched pairs:  {pair_stats['pairs']} ({pair_stats['quantity']:.0f} shares)",
+                f"Pair cost:      {pair_cost:.4f}" if pair_cost is not None else "Pair cost:      n/a",
+                f"Unmatched:      {pair_stats['unmatched']} fills",
+                f"Reward time:    {self.maker_qualified_seconds:.0f}s qualified",
+            ]
+            up = sum(f["quantity"] for f in self.maker_fills if f["side"] == "UP")
+            down = sum(f["quantity"] for f in self.maker_fills if f["side"] == "DOWN")
+            if down > 1e-9:
+                maker_lines.append(f"Up/Down ratio:  {up / down:.3f}")
         windows = sorted(window for window in window_ids if window > 0)
         lines = [
             f"# P&L Summary — {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}",
@@ -652,8 +667,7 @@ class PaperPortfolio:
             f"Total cost:     ${total_cost:.2f}",
             f"Total payout: ${total_payout:.2f}",
             f"Realized P&L: {_money(total_payout - total_cost)}",
-            "",
-        ]
+        ] + maker_lines + [""]
         for window in windows:
             group = [row for row in settled if int(row.get("window_minutes") or 0) == window]
             group_cost = sum(float(row.get("cost") or 0.0) for row in group)

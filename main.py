@@ -343,10 +343,6 @@ def _scan_loop(feed, portfolio, trader, cycles: int, interval: float, config: Co
                 portfolio.write_summary()
             if not _wait_for_next_scan(feed, interval, config, scan_started_at):
                 say(f"Next cycle in {interval:g}s...")
-    stats = portfolio.maker_pair_stats()
-    if stats["pair_cost"] is not None:
-        say(f"Maker pairs: {stats['pairs']} ({stats['quantity']:.0f} shares) "
-            f"pair cost {stats['pair_cost']:.4f} | unmatched {stats['unmatched']} fills")
     portfolio.write_summary()
     say(f"Summary written to {portfolio.summary_path}")
 
@@ -446,6 +442,13 @@ def _maker_loop(feed, portfolio, trader, cycles: int, interval: float, config: C
                 snapshot, budget=config.maker_market_budget)
             for level in fills:
                 orders.append(_maker_opportunity(snapshot, level, mid_up))
+            # Settle the reward clock for the ladder that just rested before it
+            # is replaced, otherwise a re-quote would reset the interval to zero.
+            portfolio.accrue_maker_rewards(
+                snapshot,
+                spread_threshold=config.reward_spread_threshold,
+                share_threshold=config.reward_share_threshold,
+            )
             requoted = portfolio.sync_maker_quotes(
                 snapshot, ladder, mid_up=mid_up, requote_ticks=config.requote_ticks,
             )
@@ -465,11 +468,6 @@ def _maker_loop(feed, portfolio, trader, cycles: int, interval: float, config: C
                     log(f"[REBAL TAKE] market={snapshot.market_id} {reason}")
                 else:
                     log(f"[REBAL WAIT] market={snapshot.market_id} {reason}")
-            portfolio.accrue_maker_rewards(
-                snapshot,
-                spread_threshold=config.reward_spread_threshold,
-                share_threshold=config.reward_share_threshold,
-            )
             fills_total += len(fills)
             if fills:
                 log(f"[MAKER FILL] market={snapshot.market_id} {len(fills)} level(s) "
@@ -494,6 +492,12 @@ def _maker_loop(feed, portfolio, trader, cycles: int, interval: float, config: C
                 portfolio.write_summary()
             if not _wait_for_next_scan(feed, interval, config, scan_started_at):
                 say(f"Next cycle in {interval:g}s...")
+    stats = portfolio.maker_pair_stats()
+    if stats["pair_cost"] is not None:
+        say(f"Maker pairs: {stats['pairs']} ({stats['quantity']:.0f} shares) "
+            f"pair cost {stats['pair_cost']:.4f} | unmatched {stats['unmatched']} fills")
+    else:
+        say(f"Maker pairs: 0 matched | {stats['unmatched']} unmatched fills")
     portfolio.write_summary()
     say(f"Summary written to {portfolio.summary_path}")
 

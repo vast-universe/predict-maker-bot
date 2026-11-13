@@ -125,34 +125,6 @@ def unhedged_cost_after_buy(position: dict, side: str, quantity: float, cost: fl
     return cost * (quantity - abs(net_up)) / quantity
 
 
-def find_opportunities(
-    snapshots: list[MarketSnapshot],
-    *,
-    cash: float,
-    bankroll: float,
-    max_order_cost: float,
-    risk_fraction: float,
-    remaining_exposure: float,
-    min_lead_bps: float = 0.0,
-    min_edge_per_share: float = 0.03,
-    min_order_cost: float = 1.0,
-    fixed_shares: float = 10.0,
-) -> list[Opportunity]:
-    risk_budget = min(cash, max_order_cost, bankroll * risk_fraction, remaining_exposure)
-    if risk_budget <= 0:
-        return []
-    result = []
-    for market in snapshots:
-        opportunity, _ = evaluate_market(
-            market, risk_budget=risk_budget, min_lead_bps=min_lead_bps,
-            min_edge_per_share=min_edge_per_share, min_order_cost=min_order_cost,
-            fixed_shares=fixed_shares,
-        )
-        if opportunity:
-            result.append(opportunity)
-    return result
-
-
 def evaluate_market(
     market: MarketSnapshot,
     *,
@@ -481,35 +453,6 @@ def quote_is_reward_qualified(
     if not valid_price(price) or shares + 1e-9 < share_threshold:
         return False
     return abs(float(mid) - float(price)) <= spread_threshold + 1e-12
-
-
-def reward_qualified_shares(
-    ladder: list[QuoteLevel],
-    mid: float,
-    *,
-    spread_threshold: float = 0.06,
-    share_threshold: float = 100.0,
-) -> float:
-    """Shares of the ladder that count toward the reward band."""
-    return sum(
-        level.shares
-        for level in ladder
-        if quote_is_reward_qualified(
-            level.price, mid,
-            spread_threshold=spread_threshold,
-            shares=level.shares,
-            share_threshold=share_threshold,
-        )
-    )
-
-
-def maker_fill_price(level: QuoteLevel, best_ask: Optional[float]) -> Optional[float]:
-    """A resting bid fills once the book's ask trades down to it."""
-    if not valid_price(level.price) or best_ask is None:
-        return None
-    if float(best_ask) <= float(level.price) + 1e-12:
-        return float(level.price)
-    return None
 
 
 def evaluate_rebalance_take(
