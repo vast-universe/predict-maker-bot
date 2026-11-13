@@ -1,5 +1,6 @@
 import csv
 import json
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -31,6 +32,36 @@ def _signed_money(value: float) -> str:
 
 
 @dataclass
+class RestingLevel:
+    """One simulated resting bid: price, size and whether it already traded."""
+
+    side: str
+    price: float
+    shares: float
+    filled: bool = False
+
+
+@dataclass
+class MakerQuoteState:
+    """The live two-sided ladder for one market, as the bot would rest it."""
+
+    market_id: str
+    mid_up: float
+    levels: list[RestingLevel] = field(default_factory=list)
+    quoted_at: float = 0.0
+    reward_seconds: float = 0.0        # seconds with a reward-qualified ladder
+    reward_share_seconds: float = 0.0  # qualified shares x seconds, for pool share
+    last_bids: dict = field(default_factory=dict)   # side -> {price: size}
+    last_asks: dict = field(default_factory=dict)
+
+    def unfilled(self, side: str | None = None) -> list[RestingLevel]:
+        return [
+            level for level in self.levels
+            if not level.filled and (side is None or level.side == side)
+        ]
+
+
+@dataclass
 class PaperPortfolio:
     cash: float
     data_dir: Path
@@ -43,6 +74,8 @@ class PaperPortfolio:
     market_marks: dict[str, dict[str, float | None]] = field(default_factory=dict)
     account_positions: list[dict] | None = None
     account_positions_error: str | None = None
+    maker_quotes: dict[str, MakerQuoteState] = field(default_factory=dict)
+    maker_fills: list[dict] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
@@ -95,13 +128,14 @@ class PaperPortfolio:
             writer.writeheader()
             writer.writerows(migrated_rows)
 
-    def record_trade(self, opportunity: Opportunity) -> float:
+    def record_trade(self, opportunity: Opportunity, *, maker: bool = False) -> float:
         market = opportunity.market
         position = self.open_positions.get(market.market_id)
-        if market.market_id in self.traded_market_ids:
+        if market.market_id in self.traded_market_ids and not maker:
             # Open markets may receive repeated fixed-size orders. Same-side
             # additions are allowed; opposite-side orders may only reduce the
-            # current net position and cannot flip it.
+            # current net position and cannot flip it. Maker fills are exempt:
+            # a two-sided ladder deliberately buys whichever side trades.
             if not position or opportunity.side == "PAIR":
                 return 0.0
             net_up_quantity = (
@@ -143,6 +177,12 @@ class PaperPortfolio:
                 )
             )
         position["cost"] = float(position.get("cost", 0.0)) + cost
+        if maker:
+            self.maker_fills.append({
+                "market_id": market.market_id, "side": opportunity.side,
+                "price": opportunity.ask, "quantity": opportunity.quantity,
+                "at": time.monotonic(),
+            })
         with self.log_path.open("a", newline="", encoding="utf-8") as file:
             csv.writer(file).writerow(
                 [market.observed_at, market.market_id, market.market_title or "",
@@ -211,6 +251,183 @@ class PaperPortfolio:
         self._save_state()
         self.write_summary()
         return proceeds
+
+    # ------------------------------------------------------------ maker book
+    def sync_maker_quotes(
+        self,
+        snapshot,
+        ladder: dict[str, list],
+        *,
+        mid_up: float,
+        requote_ticks: int = 1,
+        now: float | None = None,
+    ) -> bool:
+        """Rest (or re-quote) the two-sided ladder for one market.
+
+        Returns True when the ladder was replaced. The ladder is replaced only
+        after the mid moves at least ``requote_ticks`` ticks, mirroring the
+        wallet's measured behaviour (it re-quotes on drift, not on every tick).
+        """
+        now = time.monotonic() if now is None else now
+        precision = max(0, int(getattr(snapshot, "decimal_precision", 3)))
+        tick = 10 ** -precision
+        state = self.maker_quotes.get(snapshot.market_id)
+        if state is not None:
+            drifted = abs(mid_up - state.mid_up) / tick
+            if drifted + 1e-9 < max(1, requote_ticks) and state.unfilled():
+                return False
+        levels = [
+            RestingLevel(side=side, price=level.price, shares=level.shares)
+            for side, side_levels in ladder.items()
+            for level in side_levels
+        ]
+        self.maker_quotes[snapshot.market_id] = MakerQuoteState(
+            market_id=snapshot.market_id, mid_up=mid_up, levels=levels, quoted_at=now,
+        )
+        return True
+
+    def collect_maker_fills(self, snapshot, *, budget: float | None = None) -> list[RestingLevel]:
+        """Fill resting bids whose price the book's ask has traded down to.
+
+        A level is only marked filled when the paper ledger can actually pay for
+        it, so the resting book never claims a fill the cash could not fund.
+        """
+        state = self.maker_quotes.get(snapshot.market_id)
+        if state is None:
+            return []
+        # Fill detection from book depth, not from price movement. The book is
+        # the whole Yes side, so a level's size shrinking means shares traded at
+        # that price while the mid stood still -- exactly how the tracked wallet
+        # gets both sides filled at the same mid and lands a 0.963 pair cost.
+        # Price-crossing rules cannot express that: they only fill once the price
+        # has already moved past the level, which always prices a pair at 1.00.
+        traded = self._traded_shares(state, snapshot)
+        committed = float((self.open_positions.get(snapshot.market_id) or {}).get("cost", 0.0))
+        fills = []
+        for level in state.unfilled():
+            side_traded = traded.get(level.side, {})
+            if not side_traded:
+                continue
+            # Any trade at or above our bid can consume it.
+            if not any(price >= level.price - 1e-12 for price in side_traded):
+                continue
+            cost = level.shares * level.price
+            if cost > self.cash + 1e-9:
+                continue
+            if budget is not None and committed + cost > budget + 1e-9:
+                continue
+            level.filled = True
+            committed += cost
+            fills.append(level)
+        return fills
+
+    def _traded_shares(self, state: MakerQuoteState, snapshot) -> dict[str, dict[float, float]]:
+        """Shares that traded per price level since the previous book snapshot.
+
+        Down-side levels are derived from the Yes book: a Down bid at p is a Yes
+        ask at 1-p, so Down depth is read off the mirrored Yes side.
+        """
+        precision = max(0, int(getattr(snapshot, "decimal_precision", 3)))
+        total_ticks = 10 ** precision
+        books = {"UP": snapshot.up_bids, "DOWN": snapshot.up_asks}
+        traded: dict[str, dict[float, float]] = {}
+        for side, levels in books.items():
+            current: dict[float, float] = {}
+            for price, size in levels or ():
+                ticks = round(price * total_ticks)
+                if side == "DOWN":
+                    ticks = total_ticks - ticks
+                current[round(ticks / total_ticks, precision)] = size
+            previous = state.last_bids if side == "UP" else state.last_asks
+            if previous:
+                for price, before in previous.items():
+                    after = current.get(price, 0.0)
+                    if before - after > 1e-9:
+                        traded.setdefault(side, {})[price] = before - after
+            if side == "UP":
+                state.last_bids = current
+            else:
+                state.last_asks = current
+        return traded
+
+    def accrue_maker_rewards(
+        self,
+        snapshot,
+        *,
+        spread_threshold: float = 0.06,
+        share_threshold: float = 100.0,
+        now: float | None = None,
+    ) -> None:
+        """Track how long a reward-qualified ladder rested on the book."""
+        state = self.maker_quotes.get(snapshot.market_id)
+        if state is None:
+            return
+        now = time.monotonic() if now is None else now
+        elapsed = max(0.0, now - state.quoted_at) if state.quoted_at else 0.0
+        state.quoted_at = now
+        if elapsed <= 0:
+            return
+        qualified = sum(
+            level.shares for level in state.unfilled()
+            if abs(level.price - (state.mid_up if level.side == "UP" else 1.0 - state.mid_up))
+            <= spread_threshold + 1e-12 and level.shares + 1e-9 >= share_threshold
+        )
+        if qualified > 0:
+            state.reward_seconds += elapsed
+            state.reward_share_seconds += qualified * elapsed
+
+    def drop_maker_quotes(self, keep_market_ids: set[str]) -> None:
+        """Forget ladders for rounds that rolled over or resolved."""
+        for market_id in list(self.maker_quotes):
+            if market_id not in keep_market_ids:
+                del self.maker_quotes[market_id]
+
+    def maker_pair_stats(self, window_seconds: float = 2.0) -> dict:
+        """Pair opposite-side maker fills by time and price the real pair cost.
+
+        The wallet's own measured figure is computed the same way: an Up fill and
+        a Down fill within a couple of seconds of each other in the same market
+        are one matched pair, and the pair costs ``up_price + down_price``.
+        Aggregate averages are meaningless when the two sides fill at different
+        mid levels, which is why this pairing is the comparable metric.
+        """
+        by_market: dict[str, dict[str, list]] = {}
+        for fill in self.maker_fills:
+            by_market.setdefault(fill["market_id"], {"UP": [], "DOWN": []})[
+                fill["side"]].append(fill)
+        pairs, unmatched = [], 0
+        for sides in by_market.values():
+            used: set[int] = set()
+            for up in sides["UP"]:
+                best, best_gap = None, None
+                for index, down in enumerate(sides["DOWN"]):
+                    if index in used:
+                        continue
+                    gap = abs(down["at"] - up["at"])
+                    if gap <= window_seconds and (best_gap is None or gap < best_gap):
+                        best, best_gap = index, gap
+                if best is None:
+                    unmatched += 1
+                    continue
+                used.add(best)
+                down = sides["DOWN"][best]
+                quantity = min(up["quantity"], down["quantity"])
+                pairs.append((quantity, up["price"] + down["price"]))
+            unmatched += len(sides["DOWN"]) - len(used)
+        if not pairs:
+            return {"pairs": 0, "quantity": 0.0, "pair_cost": None, "unmatched": unmatched}
+        total_quantity = sum(quantity for quantity, _ in pairs)
+        weighted = sum(quantity * cost for quantity, cost in pairs)
+        return {
+            "pairs": len(pairs),
+            "quantity": total_quantity,
+            "pair_cost": weighted / total_quantity if total_quantity else None,
+            "unmatched": unmatched,
+        }
+
+    @property
+    def maker_qualified_seconds(self) -> float:
+        return sum(state.reward_seconds for state in self.maker_quotes.values())
 
     @property
     def open_exposure(self) -> float:

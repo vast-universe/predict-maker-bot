@@ -49,12 +49,33 @@ class MarketSnapshot:
     price_feed_provider: Optional[str] = None
     price_feed_symbol: Optional[str] = None
     market_title: Optional[str] = None
+    # Best bids, needed by the market maker to price quotes off the mid.
+    up_bid: Optional[float] = None
+    down_bid: Optional[float] = None
+    decimal_precision: int = 3
+    # Whole Yes book as [(price, size), ...]; the maker diffs consecutive books
+    # to detect fills, which price-only snapshots cannot reveal.
+    up_bids: tuple = ()
+    up_asks: tuple = ()
 
 
 def down_ask_from_yes_bid(yes_bid: float, decimal_precision: int) -> float:
     """Convert the best Yes bid into the complementary No/Down ask price."""
     tick = Decimal(1).scaleb(-decimal_precision)
     return float((Decimal(1) - Decimal(str(yes_bid))).quantize(tick))
+
+
+def _levels(raw) -> tuple:
+    """Normalise a book side into ((price, size), ...) with invalid rows dropped."""
+    out = []
+    for row in raw or []:
+        try:
+            price, size = float(row[0]), float(row[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if valid_price(price) and size > 0:
+            out.append((price, size))
+    return tuple(out)
 
 
 def valid_price(price: Optional[float]) -> bool:
@@ -570,8 +591,10 @@ class PredictMarketFeed:
         for market in self._markets:
             market_id = str(market["id"])
             live = live_quotes.get(market_id)
+            live_book = self.live.book_payload(market_id) if self.live is not None else None
             if live is not None:
                 up_ask, down_ask = live.up_ask, live.down_ask
+                up_bid, down_bid = live.up_bid, live.down_bid
                 timestamp_ms = live.timestamp_ms
                 if up_ask is None and down_ask is None:
                     self.diagnostics.append(
@@ -585,7 +608,9 @@ class PredictMarketFeed:
                     continue
                 up_ask = quote_price(quote.get("bestAsk"))
                 yes_bid = quote_price(quote.get("bestBid"))
+                up_bid = yes_bid
                 down_ask = round(1.0 - yes_bid, 6) if yes_bid is not None else None
+                down_bid = round(1.0 - up_ask, 6) if up_ask is not None else None
                 timestamp_ms = quote.get("updateTimestampMs")
                 if up_ask is None and down_ask is None:
                     self.diagnostics.append(
@@ -594,6 +619,10 @@ class PredictMarketFeed:
                     continue
             if not valid_price(down_ask):
                 down_ask = None
+            if not valid_price(up_bid):
+                up_bid = None
+            if not valid_price(down_bid):
+                down_bid = None
             if up_ask is None or down_ask is None:
                 missing = "UP bestAsk" if up_ask is None else "DOWN quote (Yes bestBid)"
                 self.diagnostics.append(
@@ -626,6 +655,11 @@ class PredictMarketFeed:
                     price_feed_provider=market.get("price_feed_provider"),
                     price_feed_symbol=market.get("price_feed_symbol"),
                     market_title=market.get("title"),
+                    up_bid=up_bid,
+                    down_bid=down_bid,
+                    decimal_precision=int(market.get("decimal_precision", 3)),
+                    up_bids=_levels(live_book.get("bids") if live_book else None),
+                    up_asks=_levels(live_book.get("asks") if live_book else None),
                 )
             )
         return snapshots

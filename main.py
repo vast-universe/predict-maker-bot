@@ -10,11 +10,14 @@ from config import Config
 from markets import PredictMarketFeed, valid_price
 from paper_portfolio import PaperPortfolio
 from strategy import (
+    Opportunity,
     evaluate_arb,
     evaluate_hedge,
     evaluate_market,
     evaluate_rebalance,
     hedge_reserve,
+    mid_up_price,
+    quote_ladder,
 )
 from trader import PaperTrader
 
@@ -39,7 +42,7 @@ def _asset_line(snapshot, quoted: int, scanned: int, signals: int) -> str:
     )
 
 
-def _execute_orders(trader: PaperTrader, orders: list) -> int:
+def _execute_orders(trader: PaperTrader, orders: list, *, maker: bool = False) -> int:
     """Fill a scan batch in parallel, committing paper state in submission order."""
     if not orders:
         return 0
@@ -51,7 +54,7 @@ def _execute_orders(trader: PaperTrader, orders: list) -> int:
             while turn[0] != index:
                 condition.wait()
             try:
-                return trader.execute(opportunity)
+                return trader.execute(opportunity, maker=maker)
             finally:
                 turn[0] += 1
                 condition.notify_all()
@@ -141,7 +144,8 @@ def run(cycles: int, interval: float, config: Config) -> None:
         warm_up = getattr(feed, "warm_up", None)
         if callable(warm_up):
             warm_up(config.ws_warmup_seconds)
-        _scan_loop(feed, portfolio, trader, cycles, interval, config, say, log)
+        loop = _maker_loop if config.maker_mode else _scan_loop
+        loop(feed, portfolio, trader, cycles, interval, config, say, log)
     finally:
         close = getattr(feed, "close", None)
         if callable(close):
@@ -338,6 +342,141 @@ def _scan_loop(feed, portfolio, trader, cycles: int, interval: float, config: Co
                 portfolio.write_summary()
             if not _wait_for_next_scan(feed, interval, config, scan_started_at):
                 say(f"Next cycle in {interval:g}s...")
+    stats = portfolio.maker_pair_stats()
+    if stats["pair_cost"] is not None:
+        say(f"Maker pairs: {stats['pairs']} ({stats['quantity']:.0f} shares) "
+            f"pair cost {stats['pair_cost']:.4f} | unmatched {stats['unmatched']} fills")
+    portfolio.write_summary()
+    say(f"Summary written to {portfolio.summary_path}")
+
+
+def _inventory_skew(portfolio: PaperPortfolio, snapshot, config: Config) -> float:
+    """Shift quotes against the current net position to mean-revert inventory."""
+    position = portfolio.open_positions.get(snapshot.market_id)
+    if not position:
+        return 0.0
+    net = float(position.get("up_quantity", 0.0)) - float(position.get("down_quantity", 0.0))
+    scale = max(1.0, config.level_shares * max(1, config.ladder_levels))
+    ratio = max(-1.0, min(1.0, net / scale))
+    return ratio * config.skew_cents_max
+
+
+def _maker_opportunity(snapshot, level, mid_up: float):
+    """Turn one simulated maker fill into the ledger's Opportunity shape."""
+    probability = mid_up if level.side == "UP" else 1.0 - mid_up
+    return Opportunity(
+        market=snapshot, side=level.side, quantity=level.shares, ask=level.price,
+        fair_probability=probability, fee_per_share=0.0, cost_per_share=level.price,
+        expected_edge_per_share=0.0, lead_bps=0.0,
+        up_ask=snapshot.up_ask if level.side == "UP" else None,
+        down_ask=snapshot.down_ask if level.side == "DOWN" else None,
+        up_cost_per_share=level.price if level.side == "UP" else 0.0,
+        down_cost_per_share=level.price if level.side == "DOWN" else 0.0,
+        up_order_quantity=level.shares if level.side == "UP" else 0.0,
+        down_order_quantity=level.shares if level.side == "DOWN" else 0.0,
+        strategy="maker",
+    )
+
+
+def _maker_line(snapshot, mid_up: float, state, fills: int,
+                spread_threshold: float = 0.06) -> str:
+    """One console line per market: mid, both ladders, reward-qualified size."""
+    resting = state.unfilled() if state else []
+    up_prices = [f"{level.price:.2f}" for level in resting if level.side == "UP"]
+    down_prices = [f"{level.price:.2f}" for level in resting if level.side == "DOWN"]
+    qualified = sum(
+        level.shares for level in resting
+        if abs(level.price - (mid_up if level.side == "UP" else 1.0 - mid_up))
+        <= spread_threshold + 1e-12
+    )
+    seconds = int(max(0.0, snapshot.seconds_left or 0.0))
+    return (
+        f"[{snapshot.asset}] {_short_title(snapshot)} @{seconds}s "
+        f"mid={mid_up:.2f} | Up {'/'.join(up_prices) or '-'} "
+        f"| Down {'/'.join(down_prices) or '-'} | qual={qualified:.0f}sh fill={fills}"
+    )
+
+
+def _maker_loop(feed, portfolio, trader, cycles: int, interval: float, config: Config,
+                say, log) -> None:
+    """Two-sided bid ladder: re-quote on mid drift, fill when the ask trades down."""
+    cycle = 0
+    last_rest_at = 0.0
+    last_summary_at = 0.0
+    while cycles == 0 or cycle < cycles:
+        cycle += 1
+        scan_started_at = time.monotonic()
+        if scan_started_at - last_rest_at >= interval:
+            last_rest_at = scan_started_at
+            _check_settlements(feed, portfolio, log)
+            _refresh_account_positions(feed, portfolio, config, say, log)
+        try:
+            snapshots = feed.get_snapshots()
+            for diagnostic in getattr(feed, "diagnostics", []):
+                log(f"[FEED] {diagnostic}")
+            portfolio.update_market_marks(snapshots)
+        except RuntimeError as error:
+            say(f"Market scan failed: {error}")
+            if cycles == 0 or cycle < cycles:
+                time.sleep(interval)
+                continue
+            break
+
+        portfolio.drop_maker_quotes({snapshot.market_id for snapshot in snapshots})
+        orders, lines, fills_total = [], [], 0
+        for snapshot in snapshots:
+            mid_up = mid_up_price(snapshot)
+            if mid_up is None:
+                log(f"[MAKER SKIP] market={snapshot.market_id} no two-sided mid")
+                continue
+            ladder = quote_ladder(
+                snapshot,
+                offset_cents=config.quote_offset_cents,
+                levels=config.ladder_levels,
+                step_cents=config.ladder_step_cents,
+                level_shares=config.level_shares,
+                skew_cents=_inventory_skew(portfolio, snapshot, config),
+                low_price_shrink_below=config.low_price_shrink_below,
+                low_price_shrink_factor=config.low_price_shrink_factor,
+            )
+            # Fill the ladder that was resting through this book first: the mid
+            # has already moved, so those bids are the ones a taker just hit.
+            fills = portfolio.collect_maker_fills(
+                snapshot, budget=config.maker_market_budget)
+            for level in fills:
+                orders.append(_maker_opportunity(snapshot, level, mid_up))
+            requoted = portfolio.sync_maker_quotes(
+                snapshot, ladder, mid_up=mid_up, requote_ticks=config.requote_ticks,
+            )
+            portfolio.accrue_maker_rewards(
+                snapshot,
+                spread_threshold=config.reward_spread_threshold,
+                share_threshold=config.reward_share_threshold,
+            )
+            fills_total += len(fills)
+            if fills:
+                log(f"[MAKER FILL] market={snapshot.market_id} {len(fills)} level(s) "
+                    f"{'requoted' if requoted else 'held'}")
+            lines.append(_maker_line(snapshot, mid_up,
+                                     portfolio.maker_quotes.get(snapshot.market_id), len(fills),
+                                     config.reward_spread_threshold))
+
+        status = feed.ws_status() if hasattr(feed, "ws_status") else "ws=off"
+        say(f"{'' if cycle == 1 else chr(10)}--- Cycle {cycle} ---  {status}")
+        for line in lines:
+            say(line)
+        if orders:
+            say(f"* Executing {len(orders)} maker fills in parallel...")
+            _execute_orders(trader, orders, maker=True)
+        else:
+            log("No maker fills this cycle")
+        log(f"Cash remaining: ${portfolio.cash:.2f} | qualified {portfolio.maker_qualified_seconds:.0f}s")
+        if cycles == 0 or cycle < cycles:
+            if time.monotonic() - last_summary_at >= interval:
+                last_summary_at = time.monotonic()
+                portfolio.write_summary()
+            if not _wait_for_next_scan(feed, interval, config, scan_started_at):
+                say(f"Next cycle in {interval:g}s...")
     portfolio.write_summary()
     say(f"Summary written to {portfolio.summary_path}")
 
@@ -349,6 +488,14 @@ def parse_args() -> argparse.Namespace:
                         help="max seconds between scans; a pushed book rescans sooner")
     parser.add_argument("--min-scan", type=float, default=Config.min_scan_interval,
                         help="minimum seconds between WebSocket-driven scans")
+    parser.add_argument("--mode", choices=("maker", "taker"), default="maker",
+                        help="maker: two-sided bid ladder; taker: directional entries")
+    parser.add_argument("--offset", type=float, default=Config.quote_offset_cents,
+                        help="maker top level distance below the mid, in cents")
+    parser.add_argument("--levels", type=int, default=Config.ladder_levels,
+                        help="maker ladder depth per side")
+    parser.add_argument("--level-shares", type=float, default=Config.level_shares,
+                        help="shares rested on each maker level")
     parser.add_argument("--assets", default=",".join(Config.assets),
                         help="comma-separated assets, e.g. BTC,ETH,BNB")
     parser.add_argument("--windows", default=",".join(str(w) for w in Config.windows_minutes),
@@ -373,6 +520,12 @@ def parse_args() -> argparse.Namespace:
         parser.error("--shares, --starting-cash and --interval must be finite and positive")
     if not math.isfinite(args.min_scan) or args.min_scan <= 0:
         parser.error("--min-scan must be finite and positive")
+    if not math.isfinite(args.offset) or args.offset < 0:
+        parser.error("--offset must be finite and >= 0")
+    if args.levels < 1:
+        parser.error("--levels must be >= 1")
+    if not math.isfinite(args.level_shares) or args.level_shares <= 0:
+        parser.error("--level-shares must be finite and positive")
     if args.min_scan > args.interval:
         parser.error("--min-scan must not exceed --interval")
     return args
@@ -384,7 +537,9 @@ if __name__ == "__main__":
         config = replace(
             Config(), fixed_shares=args.shares, starting_cash=args.starting_cash,
             data_dir=args.data_dir, assets=args.assets, windows_minutes=args.windows,
-            min_scan_interval=args.min_scan,
+            min_scan_interval=args.min_scan, maker_mode=args.mode == "maker",
+            quote_offset_cents=args.offset, ladder_levels=args.levels,
+            level_shares=args.level_shares,
         )
         run(args.cycles, args.interval, config)
     except KeyboardInterrupt:

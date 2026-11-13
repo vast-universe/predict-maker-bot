@@ -11,12 +11,12 @@ class PaperTrader:
     def __init__(self, portfolio: PaperPortfolio):
         self.portfolio = portfolio
 
-    def execute(self, opportunity: Opportunity) -> bool:
+    def execute(self, opportunity: Opportunity, *, maker: bool = False) -> bool:
         if opportunity.sell:
             return self._execute_sell(opportunity)
         if opportunity.side == "PAIR":
             return self._execute_pair(opportunity)
-        cost = self.portfolio.record_trade(opportunity)
+        cost = self.portfolio.record_trade(opportunity, maker=maker)
         if cost <= 0:
             return False
         label = SIDE_LABELS[opportunity.side]

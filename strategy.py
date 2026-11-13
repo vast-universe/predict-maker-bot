@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from math import ceil, erf, isfinite, log, sqrt
+from math import ceil, erf, floor as math_floor, isfinite, log, sqrt
 from typing import Optional
 
 from markets import MarketSnapshot, valid_price
@@ -375,3 +375,138 @@ def _lead_bps(market: MarketSnapshot) -> float:
     if market.spot_price is None or market.price_to_beat is None or market.price_to_beat <= 0:
         return 0.0
     return (market.spot_price / market.price_to_beat - 1.0) * 10_000.0
+
+
+# ---------------------------------------------------------------------------
+# Maker quoting: replicate the observed two-sided bid ladder
+#
+# The tracked wallet quotes Bids on both outcomes (never Asks), one cent apart,
+# several levels deep, and holds to redemption. Measured from 3000 fills:
+#   * pair cost at the same instant: median 0.970  -> 1.5c per side below mid
+#   * level spacing: 1c (97% of fills sit on the 1c grid)
+#   * ladder depth: median 3 levels live, up to 8
+#   * level size: p99 = 100 shares, matching the market's shareThreshold
+#   * rewards: hourlyRate per market, spreadThreshold 0.06, shareThreshold 100
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class QuoteLevel:
+    """One resting bid: price on the market's tick grid and its size in shares."""
+
+    price: float
+    shares: float
+
+
+def mid_up_price(market: MarketSnapshot) -> Optional[float]:
+    """Fair Up price from the book: midpoint of the two-sided Up quote."""
+    if valid_price(market.up_bid) and valid_price(market.up_ask):
+        return (float(market.up_bid) + float(market.up_ask)) / 2.0
+    # One-sided book: fall back to the Down ask complement so quoting still runs.
+    if valid_price(market.up_ask) and valid_price(market.down_ask):
+        return (float(market.up_ask) + (1.0 - float(market.down_ask))) / 2.0
+    if valid_price(market.up_bid) and valid_price(market.down_bid):
+        return (float(market.up_bid) + (1.0 - float(market.down_bid))) / 2.0
+    return None
+
+
+def _snap_to_tick(price: float, precision: int) -> float:
+    """Round a price onto the market's tick grid."""
+    tick = 10 ** -precision
+    steps = math_floor(price / tick + 0.5)
+    return round(min(max(steps * tick, tick), 1.0 - tick), precision)
+
+
+def quote_ladder(
+    market: MarketSnapshot,
+    *,
+    offset_cents: float = 1.0,
+    levels: int = 6,
+    step_cents: float = 1.0,
+    level_shares: float = 100.0,
+    skew_cents: float = 0.0,
+    low_price_shrink_below: float = 0.05,
+    low_price_shrink_factor: float = 0.3,
+) -> dict[str, list[QuoteLevel]]:
+    """Build the two-sided bid ladder around the book mid.
+
+    Both sides sit the same distance below their own mid, so a matched pair
+    costs ``1 - 2 * offset`` before fees. The observed wallet quotes its top
+    level one tick under the mid and steps one tick down per extra level, with
+    fills concentrated in the top few levels (measured mean offset 1.5c).
+    """
+    mid_up = mid_up_price(market)
+    if mid_up is None or levels <= 0 or level_shares <= 0:
+        return {"UP": [], "DOWN": []}
+    precision = max(0, int(market.decimal_precision))
+    tick = 10 ** -precision
+    total_ticks = 10 ** precision
+    ticks_per_cent = max(1, int(round(total_ticks / 100)))
+    offset_ticks = max(1, int(round(offset_cents * ticks_per_cent)))
+    step_ticks = max(1, int(round(step_cents * ticks_per_cent)))
+    # Work on the integer tick grid so every level is exactly step_ticks apart.
+    mid_ticks = int(math_floor(mid_up / tick + 0.5))
+    ladder: dict[str, list[QuoteLevel]] = {"UP": [], "DOWN": []}
+    # Inventory skew: when long Up, quote the Up bid deeper and the Down bid
+    # shallower, so the next fills pull the position back toward flat. This is
+    # the lever that fights the adverse selection of always buying the loser.
+    skew_ticks = int(round(skew_cents * ticks_per_cent))
+    for side, side_mid_ticks in (("UP", mid_ticks), ("DOWN", total_ticks - mid_ticks)):
+        side_skew = skew_ticks if side == "UP" else -skew_ticks
+        for index in range(levels):
+            ticks = side_mid_ticks - (offset_ticks + side_skew + index * step_ticks)
+            price = _snap_to_tick(ticks * tick, precision)
+            if not valid_price(price) or (ladder[side] and price >= ladder[side][-1].price):
+                # Clamping at the bottom tick would stack duplicate levels.
+                continue
+            # Extreme prices still get quoted (the wallet does trade 0.01/0.02),
+            # just with far less size: the absolute edge is tiny there while the
+            # loss risk is near total.
+            shares = level_shares
+            if price < low_price_shrink_below:
+                shares = level_shares * max(0.0, low_price_shrink_factor)
+            ladder[side].append(QuoteLevel(price=price, shares=shares))
+    return ladder
+
+
+def quote_is_reward_qualified(
+    price: float,
+    mid: float,
+    *,
+    spread_threshold: float = 0.06,
+    shares: float = 100.0,
+    share_threshold: float = 100.0,
+) -> bool:
+    """Predict pays maker rewards only for size inside the spread band."""
+    if not valid_price(price) or shares + 1e-9 < share_threshold:
+        return False
+    return abs(float(mid) - float(price)) <= spread_threshold + 1e-12
+
+
+def reward_qualified_shares(
+    ladder: list[QuoteLevel],
+    mid: float,
+    *,
+    spread_threshold: float = 0.06,
+    share_threshold: float = 100.0,
+) -> float:
+    """Shares of the ladder that count toward the reward band."""
+    return sum(
+        level.shares
+        for level in ladder
+        if quote_is_reward_qualified(
+            level.price, mid,
+            spread_threshold=spread_threshold,
+            shares=level.shares,
+            share_threshold=share_threshold,
+        )
+    )
+
+
+def maker_fill_price(level: QuoteLevel, best_ask: Optional[float]) -> Optional[float]:
+    """A resting bid fills once the book's ask trades down to it."""
+    if not valid_price(level.price) or best_ask is None:
+        return None
+    if float(best_ask) <= float(level.price) + 1e-12:
+        return float(level.price)
+    return None
