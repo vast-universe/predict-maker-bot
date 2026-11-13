@@ -279,23 +279,23 @@ class PaperPortfolio:
         }
         if state is not None:
             drifted = abs(mid_up - state.mid_up) / tick
-            if drifted + 1e-9 < max(1, requote_ticks) and state.unfilled():
-                # The mid has not moved and nothing was taken, so the ladder is
-                # still valid as-is.
-                return False
             if drifted + 1e-9 < max(1, requote_ticks):
-                # Nothing left resting but the mid is unchanged: replenish the
-                # levels that are still inside the band, like the wallet does
-                # after a level is fully taken (refills land on the same tick).
+                # The mid has not moved, so the ladder shape still holds: refill
+                # any level that was taken, keeping the rest untouched. Waiting
+                # for the whole ladder to empty would leave a visible hole in the
+                # quote after a single fill, which the wallet never shows (it
+                # refills a taken tick within seconds).
                 replenished = False
                 for level in state.levels:
                     key = (level.side, round(level.price, precision))
-                    if level.filled and key in fresh:
+                    if key not in fresh:
+                        continue
+                    if level.filled or level.shares + 1e-9 < fresh[key]:
                         level.filled = False
                         level.shares = fresh[key]
                         replenished = True
-                if replenished:
-                    return True
+                if replenished or state.unfilled():
+                    return replenished
         levels = [
             RestingLevel(side=side, price=level.price, shares=level.shares)
             for side, side_levels in ladder.items()
@@ -326,23 +326,33 @@ class PaperPortfolio:
         # Price-crossing rules cannot express that: they only fill once the price
         # has already moved past the level, which always prices a pair at 1.00.
         traded = self._traded_shares(state, snapshot)
+        precision = max(0, int(getattr(snapshot, "decimal_precision", 3)))
         committed = float((self.open_positions.get(snapshot.market_id) or {}).get("cost", 0.0))
         fills = []
         for level in state.unfilled():
             side_traded = traded.get(level.side, {})
             if not side_traded:
                 continue
-            # Any trade at or above our bid can consume it.
-            if not any(price >= level.price - 1e-12 for price in side_traded):
+            # Only a trade at our own tick can take our bid: a print one tick
+            # away does not cross it. Taking every level at or below the deepest
+            # print would fill the whole ladder from a single small trade.
+            traded_at_level = side_traded.get(round(level.price, precision), 0.0)
+            if traded_at_level <= 1e-9:
                 continue
-            cost = level.shares * level.price
+            # Assume we are somewhere in the queue at that price, so our fill is
+            # capped by the shares that actually traded there.
+            quantity = min(level.shares, traded_at_level)
+            cost = quantity * level.price
             if cost > self.cash + 1e-9:
                 continue
             if budget is not None and committed + cost > budget + 1e-9:
                 continue
-            level.filled = True
+            if quantity + 1e-9 >= level.shares:
+                level.filled = True
+            else:
+                level.shares -= quantity
             committed += cost
-            fills.append(level)
+            fills.append(RestingLevel(side=level.side, price=level.price, shares=quantity))
         return fills
 
     def _traded_shares(self, state: MakerQuoteState, snapshot) -> dict[str, dict[float, float]]:
