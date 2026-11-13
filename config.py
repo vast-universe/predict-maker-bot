@@ -62,7 +62,7 @@ class Config:
     reward_share_threshold: float = 100.0
     # The scan is WebSocket driven: a pushed book rescans after a short debounce,
     # but never more often than min_scan_interval and never later than interval.
-    min_scan_interval: float = 1.0
+    min_scan_interval: float = 3.0
     scan_debounce: float = 0.25
     ws_warmup_seconds: float = 3.0
     data_dir: str = "paper_data"
