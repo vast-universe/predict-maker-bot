@@ -272,10 +272,31 @@ class PaperPortfolio:
         precision = max(0, int(getattr(snapshot, "decimal_precision", 3)))
         tick = 10 ** -precision
         state = self.maker_quotes.get(snapshot.market_id)
+        fresh = {
+            (side, round(level.price, precision)): level.shares
+            for side, side_levels in ladder.items()
+            for level in side_levels
+        }
         if state is not None:
             drifted = abs(mid_up - state.mid_up) / tick
             if drifted + 1e-9 < max(1, requote_ticks) and state.unfilled():
+                # The mid has not moved and nothing was taken, so the ladder is
+                # still valid as-is.
                 return False
+            if drifted + 1e-9 < max(1, requote_ticks):
+                # Nothing left resting but the mid is unchanged: replenish the
+                # levels that are still inside the band, like the wallet does
+                # after a level is fully taken (refills land on the same tick).
+                replenished = False
+                for level in state.levels:
+                    key = (level.side, round(level.price, precision))
+                    if level.filled and key in fresh:
+                        level.filled = False
+                        level.shares = fresh[key]
+                        replenished = True
+                if replenished:
+                    state.quoted_at = now
+                    return True
         levels = [
             RestingLevel(side=side, price=level.price, shares=level.shares)
             for side, side_levels in ladder.items()
