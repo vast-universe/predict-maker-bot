@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-from strategy import Opportunity, unhedged_cost_after_buy
+from strategy import Opportunity, mid_up_price, unhedged_cost_after_buy
 from markets import valid_price
 
 
@@ -83,6 +83,7 @@ class PaperPortfolio:
     burst_levels: float = 2.0  # levels one snapshot may take per side
     burst_min_shares: float = 25.0  # a print smaller than this is noise, not a hit
     burst_max_shares: float = 79.0  # shares one snapshot may take in total (measured burst)
+    cancel_jump_cents: float = 3.0  # mid jump treated as cancel, not a fill
 
     def __post_init__(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
@@ -347,6 +348,16 @@ class PaperPortfolio:
             return []
         traded, previous_depth = self._traded_shares(state, snapshot)
         precision = max(0, int(getattr(snapshot, "decimal_precision", 3)))
+        # A tick whose depth vanished may have traded, or every maker may simply
+        # have cancelled as the mid moved away; a snapshot cannot tell them apart.
+        # Measured on the wallet, 90% of consecutive same-side fills sit within 3
+        # cents of each other, so a larger jump is treated as cancel-and-replace
+        # rather than a fill.
+        current_mid = mid_up_price(snapshot)
+        if (current_mid is not None and self.cancel_jump_cents
+                and state.mid_up
+                and abs(current_mid - state.mid_up) > self.cancel_jump_cents / 100.0):
+            return []
         committed = float((self.open_positions.get(snapshot.market_id) or {}).get("cost", 0.0))
         now_mono = time.monotonic()
         queue_ramp = self.queue_ramp if queue_ramp is None else queue_ramp
