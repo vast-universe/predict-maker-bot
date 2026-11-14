@@ -1,18 +1,50 @@
 # Architecture
 
-1. `main.py` loads Predict market snapshots, estimates fair value, and runs the paper scan loop.
-1a. `markets.py`'s `PredictWebSocketFeed` runs one background WebSocket connection to `wss://ws.predict.fun/ws`. It echoes heartbeats, reconnects with backoff, resubscribes on every new connection, and keeps the latest order book per market in a thread-safe store. `markets.py` subscribes the tracked rounds to `predictOrderbook`, `predictTradingStatus`, `predictMarketStatus` and `predictMarketChanged`, builds UP/DOWN quotes from the streamed book (Down = 1 - Up at the market's precision), and only calls the REST `markets/quotes` endpoint for markets without a fresh streamed quote (older than 15 seconds, or cold start). The streamed book frame has no `decimalPrecision`, so discovery's per-market value is kept and threaded into the quote builder. `predictMarketChanged` triggers a throttled rediscovery so a rolled or resolved round is replaced without waiting for the TTL.
-1b. The scan loop is push driven. `PredictMarketFeed.warm_up` discovers the tracked rounds and waits (bounded by `ws_warmup_seconds`) for a first streamed book, so the first scan prices off the socket. `main._wait_for_next_scan` blocks on `PredictWebSocketFeed.wait_for_update`; a pushed message ends the wait, `scan_debounce` lets a burst settle, and `min_scan_interval` floors the scan rate while `interval` caps it. With the socket down the wait times out and the loop polls on `interval`. Settlement and account reads stay on the slower `interval` cadence so the hot path is stream-only, and the cycle banner reports `ws=live msgs=… reconn=… last=…` or `ws=down rest-fallback`.
-2. `markets.py` reads open Predict crypto up/down rounds, including the opening price, resolution provider, close time, fee rate, and rewards metadata, and redisovers them every 10 seconds as rounds roll. It accepts current Chainlink rounds only and continues past ineligible candidates. UP and DOWN asks are independently optional; one missing quote does not discard the available side. Invalid or zero-size levels are unavailable.
-3. `strategy.py` compares probability minus fee-inclusive cost across the available sides and selects the largest edge, requiring at least 3 cents per net share. It targets 10 net shares and increases quantity to meet the $1 gross order minimum, without a fixed share-count cap. The scan loop can place another order on a later scan while the same direction still qualifies and budget remains. It caps the 5-minute model at 95% while more than two minutes remain. Missing hedge asks cause a wait; missing bids cause held position marks to be unavailable.
-4. The probability comes from a lognormal model on the distance to the opening price when a reference price and volatility are supplied. Without them it falls back to the book-implied probability, so the scan still evaluates quotes instead of going silent.
-5. Each scan evaluates hedges across all markets before adding new directional risk. Hedges target 10 net shares or enough to meet the minimum order cost, never exceeding unmatched inventory. A remainder below 10 shares may be hedged if it meets the minimum. The hedge's fee-inclusive cost plus the unmatched shares' average cost must be below $1 by the configured lock margin. `paper_portfolio.py` tracks the unmatched cost separately from previously paired shares and reconstructs it from old fill histories on migration.
-6. Each order is capped at 10% of starting cash and the $100 order limit; all open positions share the same 10% exposure budget. New entries must leave enough cash and exposure budget to hedge all unmatched shares at the configured lock threshold. Existing reserves protect other markets' hedges. New entries are skipped if their equal-size profitable hedge would fall below the $1 minimum. Paired cost remains committed until settlement. These reserves do not ensure a qualifying hedge quote will appear.
-7. A scan also buys both legs when the fee-inclusive pair cost leaves the configured arbitrage edge (`evaluate_arb`), and trims the unmatched leg once the opposite ask trades above `rebalance_trigger` (`evaluate_rebalance`, which sells at `1 - opposite_ask`).
-8. `main.py` polls open paper positions by market ID and applies settlement only after Predict reports `RESOLVED`.
-9. `trader.py` prints `[PAPER] BUY/SELL` fills and records them through `paper_portfolio.py`. The paper execution assumes an order fills at the displayed ask; it does not simulate depth, latency, partial fills, or a failed hedge.
-10. `paper_portfolio.py` keeps the ledgers in `paper_data/`: `pnl_log.csv` for every simulated fill and settlement, `portfolio.json` for cash and open inventory, and `pnl_summary.txt` for the compact summary (totals, one block per window with per-market results).
+1. `main.py` drives one scan loop. `--mode maker` (default) runs `_maker_loop`,
+   `--mode taker` runs the directional `_scan_loop`.
+1a. `markets.py`'s `PredictWebSocketFeed` runs one background WebSocket connection
+   to `wss://ws.predict.fun/ws`. It echoes heartbeats, reconnects with backoff,
+   resubscribes on every new connection, and keeps the latest order book per
+   market in a thread-safe store. The feed subscribes `predictOrderbook`,
+   `predictTradingStatus`, `predictMarketStatus` and `predictMarketChanged`, and
+   only calls REST `markets/quotes` for markets without a fresh streamed quote.
+   The streamed book frame carries no `decimalPrecision`, so discovery's
+   per-market value is threaded into the quote builder.
+1b. The scan loop is push driven. `wait_for_update` blocks on the socket; a
+   pushed message ends the wait, `scan_debounce` lets a burst settle, and
+   `min_scan_interval` floors the scan rate while `interval` caps it. Settlement
+   and account reads stay on the slower `interval` cadence.
+2. `markets.py` discovers active rounds via `/v1/series/{slug}/rounds`, accepting
+   only current Chainlink crypto up/down markets with a start price. Snapshots
+   carry best bid/ask on both outcomes plus the whole Yes book, which the maker
+   diffs to detect fills.
+3. `strategy.py`'s `quote_ladder` builds the two-sided bid ladder: five levels
+   one cent apart from one cent under each side's own mid, 100 shares a level,
+   symmetric, with optional inventory skew and a size cut below 0.05.
+4. `paper_portfolio.py` keeps the simulated resting book. `collect_maker_fills`
+   diffs book depth, credits our queue share (floored at the measured 269-share
+   resting depth), ignores prints below `burst_min_shares`, and takes at most
+   `burst_levels` levels a side per snapshot. `sync_maker_quotes` refills a taken
+   level on the same tick when the mid has not drifted and replaces the whole
+   ladder when it has, honouring `replenish_delay`.
+5. Inventory is balanced by `evaluate_rebalance_take`, which lifts the ask on the
+   under-weighted side once |net| passes 196 shares, taking about 10 shares at a
+   time with a cooldown, paying the 2% taker fee.
+6. Settlement polls `GET /v1/markets/{id}` until Predict reports `RESOLVED`, then
+   credits `resolution.indexSet` (falling back to `outcomes[].status`) and records
+   realised P&L. `TIE` splits the payout.
+7. `paper_portfolio.py` writes `pnl_log.csv` per fill and settlement,
+   `portfolio.json` for cash and open inventory, and `pnl_summary.txt` with
+   settled results, an open-position block (size, average, mark, unrealised P&L,
+   net) and a maker block (pairs, pair cost, unmatched, reward time, Up/Down
+   ratio). `maker_pair_stats` pairs opposite-side fills inside a window so the
+   pair cost is comparable to the wallet's own measurement.
+8. `trader.py` prints `[PAPER] BUY/SELL` lines and records them through the
+   portfolio. Execution assumes the resting price fills; depth beyond the queue
+   share, latency and partial-fill risk are not simulated.
 
-This is an adaptation of public strategy descriptions, not a reproduction of Polymtradebot's private implementation or a claim of profitability. Predict's BTC round uses its Chainlink start/end rule. The model assumes normally distributed log returns when a reference feed is available. Opposite-side hedging locks profit only if its price condition is actually met and its simulated fill occurs.
-
-Predict's buy fee is modeled as `feeRateBps / 10_000 * min(price, 1 - price)` per gross share; the fee is deducted from the shares received. The market's fee rate is read from `feeRateBps` for each market.
+This is a behavioural replication of one wallet's observed market making, not a
+reproduction of its source and not a claim of profitability. The paper fill model
+is the main approximation: a real order sits inside the book and is matched by
+time priority, which a simulated order cannot observe, so per-round volume still
+runs about 1.5x high even though the pair cost and fill count match.

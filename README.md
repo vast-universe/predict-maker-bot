@@ -1,25 +1,78 @@
 # Predict.fun Paper Trading Bot
 
-This is a fresh Predict.fun implementation inspired by the public strategy descriptions on [Polymtradebot](https://polymtradebot.com/), not its private source code. It reads active crypto up/down markets and simulates fixed-size directional entries with a conditional opposite-side profit lock. It never sends orders.
+A paper market maker for Predict.fun's crypto up/down markets, modelled on the
+behaviour of the wallet `0x5E498154448608C826E005c93533B827Cbb6377e`
+(`quantbarbie`, second on the season-2 points board, about $488k realised). It
+reads live quotes over Predict's WebSocket, rests a two-sided bid ladder, books
+simulated fills, and settles from Predict's own resolution endpoint. It never
+sends orders.
 
-The paper strategy targets 10 net shares per order on the direction whose estimated win probability clears the fee-inclusive ask by at least 3 cents per share. If that order would cost less than $1, it increases the net quantity to the next whole share meeting the minimum. There is no fixed 20-share cap: available cash, per-order cost limits, and the shared exposure budget determine whether an order is affordable. Predict deducts buy fees from shares received, so gross order quantity is adjusted to target the chosen net share count. The simulation assumes each order fills at the displayed ask; depth, latency, and partial-fill risk are not simulated.
+## Maker strategy (default)
 
-UP and DOWN quotes are independent: a missing Yes bid makes the DOWN ask unavailable, while a missing Yes ask makes the UP ask unavailable. A market with just one quoted side still reaches strategy evaluation. The bot compares the estimated probability minus fee-inclusive cost for each available side and selects the largest edge; a cheap quote alone is not a buy signal. Missing, invalid, or zero-size quotes never create an executable price. A hedge waits if its required opposite-side ask is unavailable. Portfolio marks are shown as unavailable when the held side lacks a real bid.
+The behaviour below was measured from 4,200 of that wallet's fills across 27
+rounds, not guessed:
 
-Each scan first checks all open markets for profitable opposite-side hedges, then considers new directional orders. A market may receive repeated entries while the same direction qualifies and budget remains. Hedging targets 10 net shares, increases quantity when needed for the $1 minimum, and never exceeds the unmatched net position. A smaller remainder can be hedged if its order still meets the minimum; otherwise it waits. Hedges require the unmatched shares' average cost plus the opposite side's fee-inclusive cost to be below $1 by at least 1 cent per share. Historical paired inventory is excluded from the unmatched cost basis.
+| Observed in the wallet | Value |
+| --- | --- |
+| Maker share of fills | 94.8% |
+| Quote side | 100% Bids, never Asks |
+| Two-sided markets | 26 of 26 |
+| Levels resting per side | 5 (deepest observed sweep took 5 ticks) |
+| Shares per level | 100 (lifetime volume per level is a multiple of 100) |
+| Tick spacing / top offset | 1 cent / 1 cent below the mid |
+| Bid offset from mid | 1.50 cents per side (both sides equal, spread 0.00) |
+| Refill of a taken level | median 8s, 30% within 2s |
+| Fills per round | 128 over 279s, 22.8 shares each, in ~15 bursts of ~9.8 |
+| Inventory | balanced by taking the short side: 196-share trigger, 10 shares a time |
+| Reward band | `spreadThreshold` 0.06, `shareThreshold` 100, `makerFeeBps` 0 |
 
-Each order's cost is capped at 10% of starting cash and the $100 configured order limit; all open positions together share a 10% exposure budget. Before accepting a directional entry, the bot reserves enough cash and exposure budget for an equal-size hedge at the profit-lock threshold, including reserves for other markets. Reserved cash cannot fund new entries. A new entry is skipped if its profitable equal-size hedge would itself fall below the $1 order minimum. Reservations do not guarantee that a profitable hedge quote will appear. Paired positions continue to consume their full cost budget until settlement.
+Each side rests five bids one cent apart starting one cent under its own mid, so
+a matched pair costs `1 - 2 * 1c`. A level is refilled once the mid stops moving
+and abandoned once it drifts. Inventory is balanced by lifting the offer on the
+under-weighted side and paying the 2% taker fee, at the wallet's own thresholds.
 
-Predict.fun resolves these up/down markets from the configured price-feed provider's start and end prices. The directional estimate falls back to the book-implied probability, so a scan still evaluates quotes instead of going silent; without an external reference price it rarely finds a directional edge. Predict's `feeRateBps` and the gross/net share conversion are included in entry and hedge costs. Partial fills, order-book depth, and execution latency are not modeled.
+Fills are modelled from book depth, not from price crossing: our simulated order
+is not in the real book, so a print at our tick is split by queue share, using
+the measured median resting depth (269 shares) rather than the often-drained
+instant depth. Price-crossing rules were tried and gave every pair exactly 1.00.
+
+Current fidelity against the same measurements:
+
+| Metric | Bot | Wallet |
+| --- | --- | --- |
+| Fills per round | 128 | 128 |
+| Median fill | 21.5 shares | 22.8 |
+| Pair cost (2s window) | 0.9564 | 0.9630 |
+| Up/Down ratio | 0.922 | 0.970 |
+| Shares per side per round | 2,235 | 1,457 |
+
+Volume still runs about 1.5x high. That is a limit of paper fill simulation
+rather than of the strategy: the real wallet's orders sit inside the book and are
+matched by time priority, which a paper order cannot observe.
+
+Known gaps: maker rewards (`hourlyRate` 3000 per market) are not credited, only
+the time a reward-qualified ladder rests is tracked; slippage, order latency and
+partial-fill risk are not modelled.
+
+## Directional strategy (optional, `--mode taker`)
+
+`--mode taker` keeps the earlier directional entry strategy: it estimates the
+chance the round closes up, compares that against the fee-inclusive ask, and
+requires a 3-cent edge per share. It targets 10 net shares, reserves cash for an
+equal-size hedge, and can trim the unmatched leg once the opposite quote is rich.
+Missing quotes never create an executable price.
 
 ## Run
 
 ```bash
 cd predict-maker-bot
-python3.13 main.py
+.venv/bin/python main.py
 ```
 
-That tracks BTC's 5-minute round. To follow more series, name ones that exist (`GET /v1/series` lists `btc/eth/bnb-updown-{5m,15m,1h,1d}` plus stock and commodity 15m/1d slugs; there is no SOL or XRP series):
+That rests the maker ladder on BTC's 5-minute round with a $10,000 paper balance.
+A fresh `--data-dir` is needed to pick up a new starting balance, since an
+existing ledger keeps its own cash:
+ To follow more series, name ones that exist (`GET /v1/series` lists `btc/eth/bnb-updown-{5m,15m,1h,1d}` plus stock and commodity 15m/1d slugs; there is no SOL or XRP series):
 
 ```bash
 python3.13 main.py --assets BTC,ETH,BNB --windows 5,15
