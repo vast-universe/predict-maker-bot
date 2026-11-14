@@ -40,15 +40,21 @@ Current fidelity against the same measurements:
 
 | Metric | Bot | Wallet |
 | --- | --- | --- |
-| Fills per round | 128 | 128 |
-| Median fill | 21.5 shares | 22.8 |
-| Pair cost (2s window) | 0.9564 | 0.9630 |
-| Up/Down ratio | 0.922 | 0.970 |
-| Shares per side per round | 2,235 | 1,457 |
+| Shares per burst | 79 | 79 |
+| Shares per side per round | 1,185 | 1,457 |
+| Median fill | 17.7 shares | 22.8 |
+| Pair cost (2s window) | 0.9709 | 0.9630 |
+| Up/Down ratio per round | 0.79 | 0.997 median (0.17-1.62 across rounds) |
 
-Volume still runs about 1.5x high. That is a limit of paper fill simulation
-rather than of the strategy: the real wallet's orders sit inside the book and are
-matched by time priority, which a paper order cannot observe.
+The Up/Down ratio looks unbalanced taken alone, but the wallet's own per-round
+ratio spans 0.17 to 1.62 with a p25 of 0.909, so a single round at 0.79 sits well
+inside its distribution: the wallet lets exposure run (median 196 shares before
+it acts, 200 after) rather than keeping the book flat.
+
+What still differs is fill granularity: one 6s snapshot books fewer, smaller
+fills than the wallet's continuous stream. That is a limit of paper fill
+simulation rather than of the strategy, since a real order sits inside the book
+and is matched by time priority, which a simulated order cannot observe.
 
 Known gaps: maker rewards (`hourlyRate` 3000 per market) are not credited, only
 the time a reward-qualified ladder rests is tracked; slippage, order latency and
