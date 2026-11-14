@@ -139,7 +139,6 @@ def run(cycles: int, interval: float, config: Config) -> None:
         burst_levels=config.burst_levels,
         burst_min_shares=config.burst_min_shares,
         burst_max_shares=config.burst_max_shares,
-        cancel_jump_cents=config.cancel_jump_cents,
     )
     trader = PaperTrader(portfolio)
 

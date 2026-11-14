@@ -60,9 +60,6 @@ class Config:
     # One 6s snapshot merges several takers; the wallet's bursts clear a
     # median of 79 shares, so cap a snapshot's total at that.
     burst_max_shares: float = 79.0
-    # 90% of the wallet's consecutive same-side fills sit within 3 cents, so a
-    # bigger mid jump is cancel-and-replace rather than a fill.
-    cancel_jump_cents: float = 3.0
     # Deep levels fill at cheap prices when a print sweeps through them, which
     # is where the maker earns its spread. Capping how far below the touch a
     # level may fill removed exactly those fills and pushed the paired cost from
