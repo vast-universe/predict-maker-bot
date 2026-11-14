@@ -26,7 +26,7 @@ _load_env_file()
 class Config:
     assets: tuple[str, ...] = ("BTC",)
     windows_minutes: tuple[int, ...] = (5,)
-    starting_cash: float = 10_000.0
+    starting_cash: float = 300.0
     max_order_cost: float = 100.0
     risk_fraction: float = 0.10
     max_exposure_fraction: float = 0.10
@@ -46,7 +46,14 @@ class Config:
     quote_offset_cents: float = 1.0
     ladder_levels: int = 5
     ladder_step_cents: float = 1.0
-    level_shares: float = 100.0
+    # 10 shares a level is the smallest fixed size that still clears Predict's
+    # 1 USDT minimum order at every tick the ladder may quote: 10 x 0.10 = 1.00.
+    # A fixed share count keeps both sides equal, so a fill on one side is always
+    # pairable by the other (fixed notional sizing drifts them apart as the price
+    # moves).
+    level_shares: float = 10.0
+    quote_min_price: float = 0.10
+    quote_max_price: float = 0.90
     requote_ticks: int = 1
     replenish_delay: float = 8.0  # wallet refills a taken tick after ~8s (median)
     queue_ramp: float = 8.0  # seconds for a fresh order to earn full queue share

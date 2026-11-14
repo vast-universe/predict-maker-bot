@@ -519,6 +519,8 @@ def _maker_loop(feed, portfolio, trader, cycles: int, interval: float, config: C
                 levels=config.ladder_levels,
                 step_cents=config.ladder_step_cents,
                 level_shares=config.level_shares,
+                min_price=config.quote_min_price,
+                max_price=config.quote_max_price,
                 skew_cents=_inventory_skew(portfolio, snapshot, config),
             )
             # Fill the ladder that was resting through this book first: the mid

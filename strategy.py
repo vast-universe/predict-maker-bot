@@ -397,6 +397,8 @@ def quote_ladder(
     step_cents: float = 1.0,
     level_shares: float = 100.0,
     skew_cents: float = 0.0,
+    min_price: float = 0.0,
+    max_price: float = 1.0,
 ) -> dict[str, list[QuoteLevel]]:
     """Build the two-sided bid ladder around the book mid.
 
@@ -429,9 +431,11 @@ def quote_ladder(
             if not valid_price(price) or (ladder[side] and price >= ladder[side][-1].price):
                 # Clamping at the bottom tick would stack duplicate levels.
                 continue
-            # Full size at every price. The wallet does not shrink at the tails:
-            # its median fill below 0.05 is 10.0 shares against 10.7 in the middle,
-            # so a size cut there would be our own invention, not its behaviour.
+            # Respect the quote band. Below it a 10-share level would be worth
+            # less than Predict's 1 USDT minimum order, so resting there would be
+            # rejected; the band keeps every level legal.
+            if not (min_price - 1e-9 <= price <= max_price + 1e-9):
+                continue
             ladder[side].append(QuoteLevel(price=price, shares=level_shares))
     return ladder
 
