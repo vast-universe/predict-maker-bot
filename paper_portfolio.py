@@ -78,11 +78,6 @@ class PaperPortfolio:
     maker_quotes: dict[str, MakerQuoteState] = field(default_factory=dict)
     maker_fills: list[dict] = field(default_factory=list)
     replenish_delay: float = 8.0  # wallet refills a taken tick after ~8s (median)
-    queue_ramp: float = 8.0  # seconds for a fresh order to reach full queue share
-    queue_depth_floor: float = 269.0  # median depth resting at our tick (measured)
-    burst_levels: float = 2.0  # levels one snapshot may take per side
-    burst_min_shares: float = 25.0  # a print smaller than this is noise, not a hit
-    burst_max_shares: float = 79.0  # shares one snapshot may take in total (measured burst)
 
     def __post_init__(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
@@ -329,152 +324,26 @@ class PaperPortfolio:
         )
         return True
 
-    def collect_maker_fills(self, snapshot, *, budget: float | None = None,
-                            queue_ramp: float | None = None,
-                            max_fill_distance: float | None = None) -> list[RestingLevel]:
-        """Fill resting bids from book depth, sharing each print by queue order.
+    def _next_tick_down(self, side: str, tick: float, precision: int) -> float | None:
+        """The tick immediately below `tick` on the same side, or None."""
+        step = 10 ** -precision
+        lower = round(tick - step, precision)
+        return lower if lower > 0 else None
 
-        Our simulated order is not in the real book, so a depth change at a tick
-        is the whole market trading there rather than our share of it. The share
-        we take is our size against the depth normally resting at that tick, then
-        limited by the per-burst caps. Booking the full print instead let a thin
-        tick hand most of its volume to us (280 fills/min against the wallet's
-        33), and waiting for the tick to clear made every fill land after the
-        price had already moved (pair cost 1.05).
-        """
-        state = self.maker_quotes.get(snapshot.market_id)
-        if state is None:
-            return []
-        traded, previous_depth = self._traded_shares(state, snapshot)
-        precision = max(0, int(getattr(snapshot, "decimal_precision", 3)))
-        committed = float((self.open_positions.get(snapshot.market_id) or {}).get("cost", 0.0))
-        now_mono = time.monotonic()
-        queue_ramp = self.queue_ramp if queue_ramp is None else queue_ramp
-        fills = []
-        # A single 3-second snapshot merges several takers into one print, which
-        # made one scan sweep six levels a side and produce 20 fills per burst
-        # against the wallet's 9.8. Cap how many levels one snapshot may take,
-        # closest to the mid first (that is where a print consumes first).
-        per_side_cap = max(1, int(round(self.burst_levels))) if self.burst_levels else None
-        burst_cap = self.burst_max_shares if self.burst_max_shares else None
-        burst_taken = 0.0
-        taken_per_side = {"UP": 0, "DOWN": 0}
-        # Interleave the sides by distance to their own mid. Sorting by side
-        # first made "DOWN" (alphabetically before "UP") consume the whole
-        # burst budget, which pushed the Up/Down ratio to 0.33.
-        ordered = sorted(
-            state.unfilled(),
-            key=lambda lv: abs(
-                lv.price - (state.mid_up if lv.side == "UP" else 1.0 - state.mid_up)
-            ),
-        )
-        for level in ordered:
-            tick = round(level.price, precision)
-            if per_side_cap is not None and taken_per_side.get(level.side, 0) >= per_side_cap:
-                continue
-            if previous_depth.get(level.side, {}).get(tick, 0.0) <= 1e-9:
-                # Nothing was resting ahead of us at this tick to be cleared.
-                continue
-            if level.placed_at and now_mono - level.placed_at < self.replenish_delay:
-                continue
-            # Queue share, not sweep-through. We rest at the same tick as other
-            # makers, so a print there is split by queue order rather than only
-            # reaching us once the tick is emptied. Waiting for the tick to clear
-            # makes every fill land after the price has already moved past it,
-            # which turned the pair cost from 0.9658 into 1.0489 and made the
-            # strategy lose money the more it traded.
-            traded_at_level = traded.get(level.side, {}).get(tick, 0.0)
-            if traded_at_level <= 1e-9:
-                continue
-            # A taker that actually reaches our tick moved a meaningful block.
-            # Counting every one-share depth wobble as a print made each 3s scan
-            # fill something, so the round never had the wallet's silent gaps
-            # (15 bursts per round, ~9.8 fills each, ~79 shares per burst).
-            if traded_at_level + 1e-9 < self.burst_min_shares:
-                continue
-            # Queue depth must be the depth that normally stands behind us, not
-            # the depth left at the instant of the print. Measured depth at our
-            # own tick is a median 269 shares, giving us a 27% queue share; using
-            # the instant depth (often nearly drained, so ~10 shares) implied a
-            # 91% share and over-filled by 3.6x, which is exactly the gap between
-            # 1/0.27 and the observed volume ratio.
-            resting_depth = previous_depth.get(level.side, {}).get(tick, 0.0)
-            resting_depth = max(resting_depth, self.queue_depth_floor)
-            queue_total = max(resting_depth, 0.0) + level.shares
-            if queue_total <= 1e-9:
-                continue
-            # Time priority: a fresh order sits behind everything already resting
-            # at the tick, so it barely trades until that queue drains. Ramping
-            # the queue share in over queue_ramp seconds is what brings the fill
-            # rate down to the wallet's 128 fills / 2,799 shares per round;
-            # crediting the full proportional share from the first tick instead
-            # produced 480-660 fills and 15k-35k shares.
-            age = now_mono - level.placed_at if level.placed_at else queue_ramp
-            ramp = 0.0 if queue_ramp <= 0 else min(1.0, max(0.0, age / queue_ramp))
-            if ramp <= 0.0:
-                continue
-            quantity = min(
-                level.shares,
-                traded_at_level * level.shares / queue_total * ramp,
-            )
-            # One snapshot can span several seconds of takers, so its total must
-            # not exceed what a single burst clears in the real book (median 79
-            # shares against the 143 we were booking).
-            if burst_cap is not None:
-                remaining = burst_cap - burst_taken
-                if remaining <= 1e-9:
-                    # Skip this level but keep scanning: a plain break would end
-                    # the loop and could starve the other side entirely.
-                    continue
-                quantity = min(quantity, remaining)
-            # One snapshot can span several seconds of price movement, during
-            # which every tick in between shows less depth and would all be
-            # counted as our fill (the median simultaneous fill spanned 28
-            # cents, up to 96). A single sweep only clears the ticks the print
-            # actually reached, so cap how far from the touch we can fill.
-            if max_fill_distance is not None:
-                touch = snapshot.up_bid if level.side == "UP" else snapshot.down_bid
-                if touch is not None and float(touch) - level.price > max_fill_distance + 1e-12:
-                    continue
-            # Budget check uses the worst case (our limit), so a fill can never
-            # be affordable at the limit and then overspend at the better price.
-            cost = quantity * level.price
-            if cost > self.cash + 1e-9:
-                continue
-            if budget is not None and committed + cost > budget + 1e-9:
-                continue
-            if quantity + 1e-9 >= level.shares:
-                level.filled = True
-            else:
-                level.shares -= quantity
-            # Book the fill at the better of our resting price and the price the
-            # book is actually showing. A sweep can drag the market far below our
-            # bid before we sample it, and charging our stale limit booked fills
-            # like 0.67 for something offered at 0.51, which drove the pair cost
-            # to 1.03 while the wallet sat at 0.84 on the same rounds.
-            fill_price = level.price
-            book_price = snapshot.up_ask if level.side == "UP" else snapshot.down_ask
-            if book_price is not None and valid_price(book_price):
-                fill_price = min(level.price, float(book_price))
-            fill_cost = quantity * fill_price
-            taken_per_side[level.side] = taken_per_side.get(level.side, 0) + 1
-            burst_taken += quantity
-            committed += fill_cost
-            fills.append(RestingLevel(side=level.side, price=fill_price, shares=quantity))
-        return fills
-
-    def _traded_shares(self, state: MakerQuoteState, snapshot) -> tuple[dict, dict]:
+    def _traded_shares(self, state: "MakerQuoteState", snapshot) -> tuple[dict, dict]:
         """Shares that traded per price level since the previous book snapshot.
 
         Down-side levels are derived from the Yes book: a Down bid at p is a Yes
         ask at 1-p, so Down depth is read off the mirrored Yes side. Returns the
-        traded amounts and the depth that was standing before this snapshot.
+        traded amounts and the depth that stood before this snapshot, which is
+        what sets our queue share.
         """
         precision = max(0, int(getattr(snapshot, "decimal_precision", 3)))
         total_ticks = 10 ** precision
         books = {"UP": snapshot.up_bids, "DOWN": snapshot.up_asks}
         traded: dict[str, dict[float, float]] = {}
         previous_depth: dict[str, dict[float, float]] = {}
+        current_depth: dict[str, dict[float, float]] = {}
         for side, levels in books.items():
             current: dict[float, float] = {}
             for price, size in levels or ():
@@ -489,18 +358,90 @@ class PaperPortfolio:
                     after = current.get(price, 0.0)
                     if before - after > 1e-9:
                         traded.setdefault(side, {})[price] = before - after
+            current_depth[side] = dict(current)
             if side == "UP":
                 state.last_bids = current
             else:
                 state.last_asks = current
-        return traded, previous_depth
+        return traded, previous_depth, current_depth
+
+    def collect_maker_fills(self, snapshot, *, budget: float | None = None) -> list[RestingLevel]:
+        """Fill a resting bid when price-time priority reaches it.
+
+        The venue matches price first, then time. Our order is not in the real
+        book, so the depth we can see at our tick is entirely ahead of us: those
+        orders were resting before ours. We therefore only trade once that depth
+        has been taken out, which the book shows as the tick going to zero with a
+        print behind it. The whole level fills at that point, up to what printed.
+
+        Nothing else is capped. Earlier versions limited fills per snapshot, levels
+        per snapshot and distance from the touch, and split each print
+        proportionally; those numbers were fitted so the summary would resemble
+        the wallet's and are not how an exchange matches.
+        """
+        state = self.maker_quotes.get(snapshot.market_id)
+        if state is None:
+            return []
+        traded, previous_depth, current_depth = self._traded_shares(state, snapshot)
+        precision = max(0, int(getattr(snapshot, "decimal_precision", 3)))
+        committed = float((self.open_positions.get(snapshot.market_id) or {}).get("cost", 0.0))
+        now_mono = time.monotonic()
+        fills = []
+        for level in state.unfilled():
+            tick = round(level.price, precision)
+            if level.placed_at and now_mono - level.placed_at < self.replenish_delay:
+                continue
+            depth_before = previous_depth.get(level.side, {}).get(tick, 0.0)
+            if depth_before <= 1e-9:
+                # Nothing rested ahead of us, so there is no queue to clear and we
+                # cannot tell from a depth delta that our own order traded.
+                continue
+            depth_after = current_depth.get(level.side, {}).get(tick, 0.0)
+            if depth_after > 1e-9:
+                # Someone is still resting at our price: time priority has not
+                # reached us yet.
+                continue
+            traded_at_level = traded.get(level.side, {}).get(tick, 0.0)
+            if traded_at_level + 1e-9 < depth_before:
+                # The depth shrank but the tick did not clear in one print, so the
+                # clearing we see is cancellations rather than a sweep.
+                continue
+            # Once our tick clears the book shows only zero, not how much traded
+            # there. The next tick down is the only evidence of whether a sweep
+            # actually ran through our price or the queue merely cancelled out: a
+            # sweep that reaches us also takes liquidity below us.
+            lower = self._next_tick_down(level.side, tick, precision)
+            lower_traded = traded.get(level.side, {}).get(lower, 0.0) if lower is not None else 0.0
+            if lower_traded <= 1e-9:
+                # Our tick emptied without the book below moving, so this reads as
+                # a cancel rather than a print through us; we did not trade.
+                continue
+            # The sweep cleared the queue ahead and reached the level below, so it
+            # filled our whole level.
+            quantity = level.shares
+            if quantity <= 1e-9:
+                continue
+            cost = quantity * level.price
+            if cost > self.cash + 1e-9:
+                continue
+            if budget is not None and committed + cost > budget + 1e-9:
+                continue
+            level.filled = True
+            # Book at the better of our limit and the price the book shows.
+            fill_price = level.price
+            book_price = snapshot.up_ask if level.side == "UP" else snapshot.down_ask
+            if book_price is not None and valid_price(book_price):
+                fill_price = min(level.price, float(book_price))
+            fill_cost = quantity * fill_price
+            committed += fill_cost
+            fills.append(RestingLevel(side=level.side, price=fill_price, shares=quantity))
+        return fills
 
     def accrue_maker_rewards(
         self,
         snapshot,
         *,
         spread_threshold: float = 0.06,
-        share_threshold: float = 100.0,
         now: float | None = None,
     ) -> None:
         """Track how long a reward-qualified ladder rested on the book."""
@@ -518,7 +459,7 @@ class PaperPortfolio:
         qualified = sum(
             level.shares for level in state.unfilled()
             if abs(level.price - (state.mid_up if level.side == "UP" else 1.0 - state.mid_up))
-            <= spread_threshold + 1e-12 and level.shares + 1e-9 >= share_threshold
+            <= spread_threshold + 1e-12
         )
         if qualified > 0:
             state.reward_seconds += elapsed

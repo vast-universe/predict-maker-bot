@@ -1,0 +1,12 @@
+{
+  "cash": 251.7253,
+  "total_cost": 0.0,
+  "filled_trades": 186,
+  "traded_market_ids": [
+    "4531845",
+    "4531914",
+    "4531950"
+  ],
+  "open_positions": {},
+  "realized_pnl": -48.2747
+}

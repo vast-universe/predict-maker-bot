@@ -11,11 +11,6 @@ from markets import PredictMarketFeed, valid_price
 from paper_portfolio import PaperPortfolio
 from strategy import (
     Opportunity,
-    evaluate_arb,
-    evaluate_hedge,
-    evaluate_market,
-    evaluate_rebalance,
-    hedge_reserve,
     evaluate_rebalance_take,
     mid_up_price,
     quote_ladder,
@@ -134,11 +129,6 @@ def run(cycles: int, interval: float, config: Config) -> None:
     portfolio = PaperPortfolio(
         config.starting_cash, Path(config.data_dir), source,
         replenish_delay=config.replenish_delay,
-        queue_ramp=config.queue_ramp,
-        queue_depth_floor=config.queue_depth_floor,
-        burst_levels=config.burst_levels,
-        burst_min_shares=config.burst_min_shares,
-        burst_max_shares=config.burst_max_shares,
     )
     trader = PaperTrader(portfolio)
     live_book = None
@@ -174,208 +164,12 @@ def run(cycles: int, interval: float, config: Config) -> None:
         warm_up = getattr(feed, "warm_up", None)
         if callable(warm_up):
             warm_up(config.ws_warmup_seconds)
-        loop = _maker_loop if config.maker_mode else _scan_loop
-        loop(feed, portfolio, trader, cycles, interval, config, say, log,
-             live_book=live_book)
+        _maker_loop(feed, portfolio, trader, cycles, interval, config, say, log,
+                    live_book=live_book)
     finally:
         close = getattr(feed, "close", None)
         if callable(close):
             close()
-
-
-def _scan_loop(feed, portfolio, trader, cycles: int, interval: float, config: Config,
-               say, log, live_book=None) -> None:
-    source = "predict"
-    cycle = 0
-    last_rest_at = 0.0  # settlement and account reads are REST; keep them off the hot path
-    last_summary_at = 0.0
-    while cycles == 0 or cycle < cycles:
-        cycle += 1
-        scan_started_at = time.monotonic()
-        if scan_started_at - last_rest_at >= interval:
-            last_rest_at = scan_started_at
-            _check_settlements(feed, portfolio, log)
-            _refresh_account_positions(feed, portfolio, config, say, log)
-        try:
-            snapshots = feed.get_snapshots()
-            for diagnostic in getattr(feed, "diagnostics", []):
-                log(f"[FEED] {diagnostic}")
-            portfolio.update_market_marks(snapshots)
-        except RuntimeError as error:
-            say(f"Market scan failed: {error}")
-            if cycles == 0 or cycle < cycles:
-                time.sleep(interval)
-                continue
-            break
-
-        stats: dict[str, dict] = {}
-        for snapshot in snapshots:
-            stat = stats.setdefault(
-                snapshot.asset, {"scanned": 0, "quoted": 0, "signals": 0, "snapshot": snapshot}
-            )
-            stat["scanned"] += 1
-            if valid_price(snapshot.up_ask) and valid_price(snapshot.down_ask):
-                stat["quoted"] += 1
-            current = stat["snapshot"]
-            if (snapshot.window_minutes, snapshot.seconds_left or float("inf")) < (
-                current.window_minutes, current.seconds_left or float("inf")
-            ):
-                stat["snapshot"] = snapshot
-            quote = (
-                f"lead={((snapshot.spot_price / snapshot.price_to_beat - 1) * 10_000):+.2f}bp"
-                if snapshot.spot_price is not None and snapshot.price_to_beat
-                else "lead=unavailable"
-            )
-            up_text = f"{snapshot.up_ask:.3f}" if snapshot.up_ask is not None else "unavailable"
-            down_text = f"{snapshot.down_ask:.3f}" if snapshot.down_ask is not None else "unavailable"
-            log(f"[{source.upper()}] {snapshot.asset} {snapshot.window_minutes}m "
-                f"market={snapshot.market_id} Up ask={up_text} "
-                f"Down ask={down_text} {quote}")
-        if not snapshots:
-            log("No open markets with usable quotes")
-
-        orders = []
-        pending_proceeds = 0.0
-        hedged_market_ids = set()
-
-        def remaining_budget() -> float:
-            return min(
-                portfolio.cash + pending_proceeds,
-                max(0.0, config.starting_cash * config.max_exposure_fraction
-                    - portfolio.open_exposure),
-            )
-
-        def reserved_cash(exclude_market_id=None) -> float:
-            return sum(
-                hedge_reserve(position, config.min_hedge_profit_per_share)
-                for market_id, position in portfolio.open_positions.items()
-                if market_id != exclude_market_id
-            )
-
-        # Trim unmatched legs when the opposite side trades rich enough.
-        for snapshot in snapshots:
-            position = portfolio.open_positions.get(snapshot.market_id)
-            if not position:
-                continue
-            opportunity, reason = evaluate_rebalance(
-                snapshot, position=position,
-                trigger=config.rebalance_trigger,
-                min_profit_per_share=config.min_rebalance_profit_per_share,
-            )
-            if opportunity:
-                orders.append(opportunity)
-                pending_proceeds += opportunity.quantity * opportunity.ask
-                stats[snapshot.asset]["signals"] += 1
-                log(f"[REBAL] {snapshot.asset} {snapshot.window_minutes}m "
-                    f"market={snapshot.market_id} sell {opportunity.side} "
-                    f"{opportunity.quantity:g} @ {opportunity.ask:.3f}")
-            else:
-                log(f"[REBAL WAIT] {snapshot.asset} {snapshot.window_minutes}m "
-                    f"market={snapshot.market_id} {reason}")
-
-        # Handle profitable hedges across all markets before adding new risk.
-        for snapshot in snapshots:
-            position = portfolio.open_positions.get(snapshot.market_id)
-            if not position:
-                continue
-            risk_budget = min(
-                config.max_order_cost,
-                config.starting_cash * config.risk_fraction,
-                max(0.0, remaining_budget() - reserved_cash(snapshot.market_id)),
-            )
-            opportunity, reason = evaluate_hedge(
-                snapshot, position=position, risk_budget=risk_budget,
-                min_order_cost=config.minimum_order_cost,
-                min_locked_profit_per_share=config.min_hedge_profit_per_share,
-                fixed_shares=config.fixed_shares,
-            )
-            if opportunity:
-                orders.append(opportunity)
-                hedged_market_ids.add(snapshot.market_id)
-                stats[snapshot.asset]["signals"] += 1
-                log(f"[FILLED] market={snapshot.market_id} hedge {opportunity.side} "
-                    f"{opportunity.quantity:g} net shares @ {opportunity.ask:.3f}")
-            elif not opportunity:
-                log(f"[HEDGE WAIT] {snapshot.asset} {snapshot.window_minutes}m "
-                    f"market={snapshot.market_id} {reason}")
-
-        for snapshot in snapshots:
-            if snapshot.market_id in hedged_market_ids:
-                continue  # At most one order per market on each scan.
-            position = portfolio.open_positions.get(snapshot.market_id)
-            if not position and snapshot.market_id in portfolio.traded_market_ids:
-                log(f"[SKIP] market={snapshot.market_id} already settled or closed")
-                continue
-            risk_budget = min(
-                config.max_order_cost,
-                config.starting_cash * config.risk_fraction,
-                max(0.0, remaining_budget() - reserved_cash()),
-            )
-            opportunity = None
-            if not position:
-                opportunity, _ = evaluate_arb(
-                    snapshot, risk_budget=risk_budget,
-                    min_order_cost=config.minimum_order_cost,
-                    fixed_shares=config.fixed_shares,
-                    min_pair_edge=config.min_pair_edge,
-                )
-            if opportunity is None:
-                opportunity, reason = evaluate_market(
-                    snapshot, risk_budget=risk_budget,
-                    min_edge_per_share=config.min_edge_per_share,
-                    min_order_cost=config.minimum_order_cost,
-                    fixed_shares=config.fixed_shares,
-                )
-            if opportunity and position:
-                net_up = float(position.get("up_quantity", 0.0)) - float(
-                    position.get("down_quantity", 0.0)
-                )
-                if ((net_up > 1e-9 and opportunity.side == "DOWN")
-                        or (net_up < -1e-9 and opportunity.side == "UP")):
-                    opportunity = None
-                    reason = "opposite-side orders must meet the profit-lock condition"
-            if opportunity and opportunity.side != "PAIR":
-                reserve = opportunity.quantity * max(
-                    0.0, 1.0 - config.min_hedge_profit_per_share - opportunity.cost_per_share
-                )
-                required = opportunity.quantity * opportunity.cost_per_share + reserve
-                available = max(0.0, remaining_budget() - reserved_cash())
-                if reserve + 1e-9 < config.minimum_order_cost:
-                    opportunity = None
-                    reason = "profitable equal-size hedge would be below the order minimum"
-                elif required > available + 1e-9:
-                    opportunity = None
-                    reason = (f"entry plus hedge reserve needs ${required:.2f}; "
-                              f"unreserved budget is ${available:.2f}")
-            if opportunity:
-                orders.append(opportunity)
-                stats[snapshot.asset]["signals"] += 1
-                log(f"[FILLED] market={snapshot.market_id} "
-                    f"{opportunity.strategy} {opportunity.side} "
-                    f"{opportunity.quantity:g} net shares @ {opportunity.ask:.3f}")
-            else:
-                log(f"[SKIP] {snapshot.asset} {snapshot.window_minutes}m "
-                    f"market={snapshot.market_id} {reason}")
-
-        status = feed.ws_status() if hasattr(feed, "ws_status") else "ws=off"
-        say(f"{'' if cycle == 1 else chr(10)}--- Cycle {cycle} ---  {status}")
-        for asset, stat in stats.items():
-            say(_asset_line(stat["snapshot"], stat["quoted"], stat["scanned"], stat["signals"]))
-        if orders:
-            say(f"* Executing {len(orders)} orders in parallel...")
-            _execute_orders(trader, orders)
-        else:
-            log("No qualifying paper trades")
-        log(f"Cash remaining: ${portfolio.cash:.2f}")
-        if cycles == 0 or cycle < cycles:
-            if time.monotonic() - last_summary_at >= interval:
-                last_summary_at = time.monotonic()
-                portfolio.write_summary()
-            if not _wait_for_next_scan(feed, interval, config, scan_started_at):
-                say(f"Next cycle in {interval:g}s...")
-    portfolio.write_summary()
-    say(f"Summary written to {portfolio.summary_path}")
-
 
 
 def _market_budget(portfolio: PaperPortfolio, config: Config) -> float:
@@ -527,8 +321,7 @@ def _maker_loop(feed, portfolio, trader, cycles: int, interval: float, config: C
             # Fill the ladder that was resting through this book first: the mid
             # has already moved, so those bids are the ones a taker just hit.
             fills = portfolio.collect_maker_fills(
-                snapshot, budget=_market_budget(portfolio, config),
-                max_fill_distance=config.max_fill_distance)
+                snapshot, budget=_market_budget(portfolio, config))
             for level in fills:
                 orders.append(_maker_opportunity(snapshot, level, mid_up))
             # Settle the reward clock for the ladder that just rested before it
@@ -536,7 +329,6 @@ def _maker_loop(feed, portfolio, trader, cycles: int, interval: float, config: C
             portfolio.accrue_maker_rewards(
                 snapshot,
                 spread_threshold=config.reward_spread_threshold,
-                share_threshold=config.reward_share_threshold,
             )
             if live_book is not None:
                 token_ids = _token_ids(feed, snapshot)
@@ -611,8 +403,6 @@ def parse_args() -> argparse.Namespace:
                         help="max seconds between scans; a pushed book rescans sooner")
     parser.add_argument("--min-scan", type=float, default=Config.min_scan_interval,
                         help="minimum seconds between WebSocket-driven scans")
-    parser.add_argument("--mode", choices=("maker", "taker"), default="maker",
-                        help="maker: two-sided bid ladder; taker: directional entries")
     parser.add_argument("--live", action="store_true",
                         help="place real orders (needs PREDICT_API_KEY, "
                              "PREDICT_ACCOUNT_ADDRESS, PRIVY_WALLET_PRIVATE_KEY)")
@@ -628,16 +418,8 @@ def parse_args() -> argparse.Namespace:
                         help="lowest price the ladder may rest at")
     parser.add_argument("--quote-max", type=float, default=Config.quote_max_price,
                         help="highest price the ladder may rest at")
-    parser.add_argument("--queue-ramp", type=float, default=Config.queue_ramp,
-                        help="seconds for a fresh maker order to earn full queue share")
     parser.add_argument("--replenish-delay", type=float, default=Config.replenish_delay,
                         help="seconds before a taken maker tick may re-quote")
-    parser.add_argument("--burst-levels", type=float, default=Config.burst_levels,
-                        help="levels one snapshot may take per side")
-    parser.add_argument("--burst-min-shares", type=float, default=Config.burst_min_shares,
-                        help="minimum print size that counts as a hit on our level")
-    parser.add_argument("--burst-max-shares", type=float, default=Config.burst_max_shares,
-                        help="shares one snapshot may take in total")
     parser.add_argument("--skew-cents", type=float, default=Config.skew_cents_max,
                         help="max inventory skew per side in cents (0 = symmetric, as measured)")
     parser.add_argument("--rebalance-trigger", type=float,
@@ -647,8 +429,6 @@ def parse_args() -> argparse.Namespace:
                         help="comma-separated assets, e.g. BTC,ETH,BNB")
     parser.add_argument("--windows", default=",".join(str(w) for w in Config.windows_minutes),
                         help="comma-separated window minutes, e.g. 5,15")
-    parser.add_argument("--shares", type=float, default=Config.fixed_shares,
-                        help="base net shares per order; increased when needed for the $1 minimum")
     parser.add_argument("--starting-cash", type=float, default=Config.starting_cash,
                         help="starting paper cash (does not reset an existing ledger)")
     parser.add_argument("--data-dir", default=Config.data_dir, help="paper ledger directory")
@@ -663,18 +443,16 @@ def parse_args() -> argparse.Namespace:
     if args.cycles < 0 or args.interval <= 0:
         parser.error("--cycles must be >= 0 and --interval must be > 0")
     if not all(math.isfinite(value) and value > 0
-               for value in (args.shares, args.starting_cash, args.interval)):
-        parser.error("--shares, --starting-cash and --interval must be finite and positive")
-    if not math.isfinite(args.min_scan) or args.min_scan <= 0:
-        parser.error("--min-scan must be finite and positive")
+               for value in (args.starting_cash, args.interval)):
+        parser.error("--starting-cash and --interval must be finite and positive")
+    if not math.isfinite(args.min_scan) or args.min_scan < 0:
+        parser.error("--min-scan must be finite and >= 0 (0 scans on every update)")
     if not math.isfinite(args.offset) or args.offset < 0:
         parser.error("--offset must be finite and >= 0")
     if args.levels < 1:
         parser.error("--levels must be >= 1")
     if not math.isfinite(args.level_shares) or args.level_shares <= 0:
         parser.error("--level-shares must be finite and positive")
-    if not math.isfinite(args.queue_ramp) or args.queue_ramp < 0:
-        parser.error("--queue-ramp must be finite and >= 0")
     if not math.isfinite(args.replenish_delay) or args.replenish_delay < 0:
         parser.error("--replenish-delay must be finite and >= 0")
     if args.min_scan > args.interval:
@@ -686,16 +464,13 @@ if __name__ == "__main__":
     args = parse_args()
     try:
         config = replace(
-            Config(), fixed_shares=args.shares, starting_cash=args.starting_cash,
+            Config(), starting_cash=args.starting_cash,
             data_dir=args.data_dir, assets=args.assets, windows_minutes=args.windows,
-            min_scan_interval=args.min_scan, maker_mode=args.mode == "maker",
+            min_scan_interval=args.min_scan,
             quote_offset_cents=args.offset, ladder_levels=args.levels,
             level_shares=args.level_shares, level_notional=args.level_notional,
             quote_min_price=args.quote_min, quote_max_price=args.quote_max,
-            queue_ramp=args.queue_ramp,
-            replenish_delay=args.replenish_delay, burst_levels=args.burst_levels,
-            burst_min_shares=args.burst_min_shares,
-            burst_max_shares=args.burst_max_shares,
+            replenish_delay=args.replenish_delay,
             live_trading=args.live, skew_cents_max=args.skew_cents,
             rebalance_trigger_shares=args.rebalance_trigger,
         )

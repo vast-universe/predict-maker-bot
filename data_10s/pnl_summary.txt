@@ -1,0 +1,19 @@
+# P&L Summary — 2026-11-14 10:15:14 UTC
+
+Settled markets: 3
+Total cost:     $327.11
+Total payout: $278.84
+Realized P&L: -$48.27
+
+--- maker ---
+Matched pairs:  33 (35 shares)
+Pair cost:      0.8981
+Unmatched:      120 fills
+Reward time:    0s qualified
+Up/Down ratio:  1.772
+
+--- 5-min markets ---
+Count: 3 | Cost: $327.11 | Payout: $278.84 | P&L: $-48.27
+Bitcoin Up or Down - November 14, 5AM-5:05AM ET → DOWN  -$0.65
+Bitcoin Up or Down - November 14, 5:05AM-5:10AM ET → DOWN  -$28.84
+Bitcoin Up or Down - November 14, 5:10AM-5:15AM ET → DOWN  -$18.79
