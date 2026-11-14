@@ -484,10 +484,15 @@ def _maker_loop(feed, portfolio, trader, cycles: int, interval: float, config: C
                 snapshot, ladder, mid_up=mid_up, requote_ticks=config.requote_ticks,
                 replenish_delay=config.replenish_delay,
             )
-            # Balance inventory by taking the side we are short of, like the
-            # wallet's aggressive fills, so the Up/Down ratio stays near 0.97.
+            # The wallet does not take to flatten inventory. All 576 of its
+            # taker-flagged fills turn out to be passive: 473 complementary
+            # matches price at exactly 1.0000 with never a crossing bid, and 103
+            # same-outcome matches price at exactly the counterparty's price. So
+            # exposure is left to accumulate and is carried to settlement, which
+            # is why its peak reaches 632 shares against our 215. Taking is off
+            # unless explicitly enabled.
             position = portfolio.open_positions.get(snapshot.market_id)
-            if position:
+            if position and config.rebalance_trigger_shares > 0:
                 take, reason = evaluate_rebalance_take(
                     snapshot, position=position,
                     risk_budget=_market_budget(portfolio, config),

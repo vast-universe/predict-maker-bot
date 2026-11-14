@@ -73,9 +73,13 @@ class Config:
     # the near-total loss risk dominate the tiny absolute edge.
     # The wallet rebalances by taking: 5% of its fills are aggressive buys on the
     # under-weighted side, which keeps its Up/Down ratio near 0.97.
-    # Measured: the wallet acts once |net| passes ~196 shares and then takes only
-    # ~10 shares, so exposure stays open instead of being flattened at once.
-    rebalance_trigger_shares: float = 196.0
+    # The wallet never takes to flatten: every taker-flagged fill of its 4,200
+    # measured fills is passive (473 complementary matches price at exactly
+    # 1.0000, 103 same-outcome matches at the counterparty's price), so exposure
+    # accumulates and is carried to settlement. A trigger of 0 disables taking;
+    # set it above 0 only if you deliberately want a flatter book than the
+    # reference wallet keeps.
+    rebalance_trigger_shares: float = 0.0
     rebalance_take_shares: float = 10.0
     rebalance_cooldown: float = 8.0
     low_price_shrink_below: float = 0.05
