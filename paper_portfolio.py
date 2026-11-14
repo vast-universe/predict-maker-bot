@@ -434,6 +434,8 @@ class PaperPortfolio:
                 touch = snapshot.up_bid if level.side == "UP" else snapshot.down_bid
                 if touch is not None and float(touch) - level.price > max_fill_distance + 1e-12:
                     continue
+            # Budget check uses the worst case (our limit), so a fill can never
+            # be affordable at the limit and then overspend at the better price.
             cost = quantity * level.price
             if cost > self.cash + 1e-9:
                 continue
@@ -443,10 +445,21 @@ class PaperPortfolio:
                 level.filled = True
             else:
                 level.shares -= quantity
+            # Book the fill at the better of our resting price and the price the
+            # book is actually showing. A sweep can drag the market far below our
+            # bid before we sample it, and charging our stale limit booked fills
+            # like 0.67 for something offered at 0.51, which drove the pair cost
+            # to 1.03 while the wallet sat at 0.84 on the same rounds.
+            fill_price = level.price
+            book_price = snapshot.up_ask if level.side == "UP" else snapshot.down_ask
+            if book_price is not None and valid_price(book_price):
+                fill_price = min(level.price, float(book_price))
+            fill_cost = quantity * fill_price
+            cost = fill_cost
             taken_per_side[level.side] = taken_per_side.get(level.side, 0) + 1
             burst_taken += quantity
-            committed += cost
-            fills.append(RestingLevel(side=level.side, price=level.price, shares=quantity))
+            committed += fill_cost
+            fills.append(RestingLevel(side=level.side, price=fill_price, shares=quantity))
         return fills
 
     def _traded_shares(self, state: MakerQuoteState, snapshot) -> tuple[dict, dict]:
