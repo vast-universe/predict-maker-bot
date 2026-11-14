@@ -65,10 +65,11 @@ class Config:
     burst_levels: float = 2.0
     # Wallet bursts move a median of 79 shares; smaller depth wobbles are
     # noise and must not register as a hit on our level.
-    burst_min_shares: float = 100.0
-    # One 6s snapshot merges several takers; the wallet's bursts clear a
-    # median of 79 shares, so cap a snapshot's total at that.
-    burst_max_shares: float = 79.0
+    # Both thresholds are scaled to the 10-share level. The old values (100 and
+    # 79) were calibrated for 100-share levels; keeping them meant a 10-share
+    # level could never reach the print threshold, so the ladder would never fill.
+    burst_min_shares: float = 2.5
+    burst_max_shares: float = 8.0
     # Deep levels fill at cheap prices when a print sweeps through them, which
     # is where the maker earns its spread. Capping how far below the touch a
     # level may fill removed exactly those fills and pushed the paired cost from
