@@ -124,15 +124,9 @@ def _lead_bps(market: MarketSnapshot) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Maker quoting: replicate the observed two-sided bid ladder
-#
-# The tracked wallet quotes Bids on both outcomes (never Asks), one cent apart,
-# several levels deep, and holds to redemption. Measured from 3000 fills:
-#   * pair cost at the same instant: median 0.970  -> 1.5c per side below mid
-#   * level spacing: 1c (97% of fills sit on the 1c grid)
-#   * ladder depth: median 3 levels live, up to 8
-#   * level size: p99 = 100 shares, matching the market's shareThreshold
-#   * rewards: hourlyRate per market, spreadThreshold 0.06, shareThreshold 100
+# Maker approximation of the reference wallet's public BUY fills. Prices and
+# completed fill quantities can be observed; original ladder depth, historical
+# midpoint offsets and cancellation triggers cannot be recovered from matches.
 # ---------------------------------------------------------------------------
 
 
@@ -167,23 +161,27 @@ def quote_ladder(
     market: MarketSnapshot,
     *,
     offset_cents: float = 1.0,
-    levels: int = 6,
+    levels: int = 5,
     step_cents: float = 1.0,
     level_shares: float = 100.0,
     skew_cents: float = 0.0,
     min_price: float = 0.0,
     max_price: float = 1.0,
     level_notional: float = 0.0,
+    min_order_cost: float = 1.0,
+    anchor_mid_up: Optional[float] = None,
 ) -> dict[str, list[QuoteLevel]]:
     """Build the two-sided bid ladder around the book mid.
 
-    Both sides sit the same distance below their own mid, so a matched pair
-    costs ``1 - 2 * offset`` before fees. The observed wallet quotes its top
-    level one tick under the mid and steps one tick down per extra level, with
-    fills concentrated in the top few levels (measured mean offset 1.5c).
+    Floor each outcome's midpoint independently to avoid rounding one bid up.
+    Keep orders below the visible opposite quote (including mint matching).
+    Offset/depth/refill settings are explicit approximations, not private rules.
     """
-    mid_up = mid_up_price(market)
-    if mid_up is None or levels <= 0 or level_shares <= 0:
+    mid_up = anchor_mid_up if anchor_mid_up is not None else mid_up_price(market)
+    if (not valid_price(mid_up) or levels <= 0 or level_shares <= 0
+            or not all(isfinite(value) for value in
+                       (offset_cents, step_cents, level_shares, skew_cents,
+                        min_price, max_price, level_notional, min_order_cost))):
         return {"UP": [], "DOWN": []}
     precision = max(0, int(market.decimal_precision))
     tick = 10 ** -precision
@@ -192,17 +190,24 @@ def quote_ladder(
     offset_ticks = max(1, int(round(offset_cents * ticks_per_cent)))
     step_ticks = max(1, int(round(step_cents * ticks_per_cent)))
     # Work on the integer tick grid so every level is exactly step_ticks apart.
-    mid_ticks = int(math_floor(mid_up / tick + 0.5))
+    mid_ticks = int(math_floor(mid_up / tick + 1e-9))
+    down_mid_ticks = int(math_floor((1.0 - mid_up) / tick + 1e-9))
     ladder: dict[str, list[QuoteLevel]] = {"UP": [], "DOWN": []}
     # Inventory skew: when long Up, quote the Up bid deeper and the Down bid
     # shallower, so the next fills pull the position back toward flat. This is
     # the lever that fights the adverse selection of always buying the loser.
     skew_ticks = int(round(skew_cents * ticks_per_cent))
-    for side, side_mid_ticks in (("UP", mid_ticks), ("DOWN", total_ticks - mid_ticks)):
+    for side, side_mid_ticks in (("UP", mid_ticks), ("DOWN", down_mid_ticks)):
         side_skew = skew_ticks if side == "UP" else -skew_ticks
+        ask = market.up_ask if side == "UP" else market.down_ask
+        passive_ceiling = (int(ceil(float(ask) / tick - 1e-9)) - 1
+                           if valid_price(ask) else total_ticks - 1)
         for index in range(levels):
-            ticks = side_mid_ticks - (offset_ticks + side_skew + index * step_ticks)
-            price = _snap_to_tick(ticks * tick, precision)
+            ticks = min(side_mid_ticks - offset_ticks - side_skew,
+                        passive_ceiling) - index * step_ticks
+            if not 0 < ticks < total_ticks:
+                continue
+            price = round(ticks * tick, precision)
             if not valid_price(price) or (ladder[side] and price >= ladder[side][-1].price):
                 # Clamping at the bottom tick would stack duplicate levels.
                 continue
@@ -219,7 +224,246 @@ def quote_ladder(
             ladder[side].append(QuoteLevel(price=price, shares=shares))
     if level_notional > 0:
         ladder = _equalise_shares(ladder, budget=level_notional * levels * 4)
-    return ladder
+    return {side: [level for level in side_levels
+                   if level.price * level.shares + 1e-9 >= min_order_cost]
+            for side, side_levels in ladder.items()}
+
+
+def risk_adjusted_ladder(
+    market: MarketSnapshot,
+    ladder: dict[str, list[QuoteLevel]],
+    *,
+    position: Optional[dict],
+    max_net_shares: float,
+    pair_margin: float,
+    max_market_cost: float,
+    stop_new_seconds: float,
+    stop_all_seconds: float,
+    shock_cents: float,
+    history_mid: Optional[float] = None,
+    min_order_cost: float = 1.0,
+    fee_rate_bps: float = 0.0,
+) -> tuple[dict[str, list[QuoteLevel]], str]:
+    """Apply our buy-only inventory policy without mutating quotes or state.
+
+    This is a self-designed policy, not a recovered wallet rule. A missing-side
+    bid must profitably pair with the existing unmatched inventory; it cannot
+    buy more shares than that inventory. Other bids respect the worst-case net
+    position if just one outcome fills. All bids together fit the remaining
+    paid-cost budget. Prices conservatively reserve share-denominated taker
+    fees for any price-improved execution up to the bid limit, supporting
+    postOnly=False even though no bid crosses the visible ask. Sizes remain gross,
+    making the one-sided net-share limits conservative. The caller reconciles
+    this entire target against its
+    resting orders before placing any increase, and owns the shock cooldown.
+    """
+    empty: dict[str, list[QuoteLevel]] = {"UP": [], "DOWN": []}
+    parameters = (max_net_shares, pair_margin, max_market_cost,
+                  stop_new_seconds, stop_all_seconds, shock_cents, min_order_cost,
+                  fee_rate_bps)
+    if (not all(isfinite(value) for value in parameters)
+            or max_net_shares <= 0 or not 0 <= pair_margin < 1
+            or max_market_cost < 0 or min_order_cost <= 0 or shock_cents < 0
+            or not 0 <= fee_rate_bps < 10_000
+            or not 0 <= stop_all_seconds <= stop_new_seconds):
+        return empty, "risk: invalid policy parameters"
+    seconds_left = market.seconds_left
+    if seconds_left is None or not isfinite(seconds_left):
+        return empty, "risk: missing time remaining"
+    if seconds_left <= stop_all_seconds:
+        return empty, "risk: final cutoff; cancel all bids"
+    mid = mid_up_price(market)
+    if not valid_price(mid):
+        return empty, "risk: missing midpoint"
+    if history_mid is not None:
+        if not valid_price(history_mid):
+            return empty, "risk: invalid previous midpoint"
+        if shock_cents > 0 and abs(mid - history_mid) + 1e-12 >= shock_cents / 100.0:
+            return empty, "risk: midpoint shock; cancel all bids"
+
+    position = position or {}
+    try:
+        up = float(position.get("up_quantity", 0.0))
+        down = float(position.get("down_quantity", 0.0))
+        if (up + down > 1e-9 and "cost" not in position
+                and ((up > 1e-9 and "up_cost" not in position)
+                     or (down > 1e-9 and "down_cost" not in position))):
+            return empty, "risk: missing inventory cost basis"
+        paid_cost = float(position.get("cost", float(position.get("up_cost", 0.0))
+                                       + float(position.get("down_cost", 0.0))))
+        unmatched_average = unhedged_average_cost(position)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return empty, "risk: invalid inventory"
+    if (not all(isfinite(value) and value >= 0
+                for value in (up, down, paid_cost, unmatched_average))):
+        return empty, "risk: invalid inventory"
+    cash_budget = max(0.0, max_market_cost - paid_cost)
+    if cash_budget + 1e-9 < min_order_cost:
+        return empty, "risk: market paid-cost limit"
+
+    net = up - down
+    missing = "DOWN" if net > 1e-9 else "UP" if net < -1e-9 else None
+    close_only = seconds_left <= stop_new_seconds
+    if close_only and missing is None:
+        return empty, "risk: close-only cutoff; inventory balanced"
+    capacities = {"UP": max(0.0, max_net_shares - net),
+                  "DOWN": max(0.0, max_net_shares + net)}
+    if missing is not None:
+        capacities[missing] = abs(net)
+    if close_only:
+        capacities["UP" if missing == "DOWN" else "DOWN"] = 0.0
+
+    precision = max(0, int(market.decimal_precision))
+    tick = 10 ** -precision
+
+    def floor_price(price: float) -> float:
+        return round(math_floor(price / tick + 1e-9) * tick, precision)
+
+    def effective_cost(price: float) -> float:
+        cost = cost_per_net_share(price, fee_rate_bps)
+        # The raw fee-adjusted curve can fall above 0.5 at very high rates.
+        # Its maximum over all executable prices <= this bid is at the bid or
+        # at 0.5. Reserving that interval maximum is monotone in the bid limit.
+        return max(cost, cost_per_net_share(0.5, fee_rate_bps)) if price >= 0.5 else cost
+
+    def price_for_cost(ceiling: float, limit: float) -> float:
+        """Highest legal tick under a net-cost cap, in logarithmic time.
+
+        Keep the fee curve's partition for compatibility; the execution-price
+        interval maximum makes the effective-cost cap monotone on each piece.
+        """
+        highest = max(0, int(math_floor(ceiling / tick + 1e-9)))
+        half = int(math_floor(0.5 / tick + 1e-9))
+        rate = fee_rate_bps / 10_000.0
+        turning = int(math_floor((2 * rate / (1 + rate)) / tick + 1e-9))
+        candidates = [0]
+
+        def increasing_search(low: int, high: int) -> None:
+            found = 0
+            while low <= high:
+                middle = (low + high) // 2
+                if effective_cost(round(middle * tick, precision)) <= limit + 1e-12:
+                    found = middle
+                    low = middle + 1
+                else:
+                    high = middle - 1
+            candidates.append(found)
+
+        increasing_search(1, min(highest, half))
+        decreasing_end = min(highest, turning)
+        if decreasing_end > half and effective_cost(
+                round(decreasing_end * tick, precision)) <= limit + 1e-12:
+            candidates.append(decreasing_end)
+        increasing_search(max(half + 1, turning + 1), highest)
+        return round(max(candidates) * tick, precision)
+
+    prepared: dict[str, list[QuoteLevel]] = {"UP": [], "DOWN": []}
+    for side in prepared:
+        if capacities[side] <= 1e-9:
+            continue
+        levels = sorted((level for level in ladder.get(side, [])
+                         if isfinite(level.price) and valid_price(level.price)
+                         and isfinite(level.shares) and level.shares > 0),
+                        key=lambda level: -level.price)
+        if not levels:
+            continue
+        ceiling = 1.0 - tick
+        ask = market.up_ask if side == "UP" else market.down_ask
+        if valid_price(ask):
+            ceiling = min(ceiling, (ceil(float(ask) / tick - 1e-9) - 1) * tick)
+        # Every individual bid must retain settlement value after a possible
+        # taker fee, even if its opposite quote is later removed or never fills.
+        cost_limit = 1.0 - pair_margin
+        if side == missing:
+            cost_limit = min(cost_limit, 1.0 - pair_margin - unmatched_average)
+        ceiling = price_for_cost(ceiling, cost_limit)
+        # Shift the whole side down together, preserving its level spacing.
+        shift = max(0.0, levels[0].price - floor_price(ceiling))
+        last_price = 1.0
+        for level in levels:
+            price = floor_price(level.price - shift)
+            if (not valid_price(price) or price >= last_price - 1e-12
+                    or effective_cost(price) > cost_limit + 1e-12):
+                continue
+            prepared[side].append(QuoteLevel(price, level.shares))
+            last_price = price
+
+    # Bound the highest effective costs, including share-denominated fees, so
+    # every cross-level net-share pairing retains the configured margin.
+    if prepared["UP"] and prepared["DOWN"]:
+        effective = {side: max(effective_cost(level.price) for level in levels)
+                     for side, levels in prepared.items()}
+        excess = max(0.0, sum(effective.values()) - (1.0 - pair_margin))
+        if excess > 1e-12:
+            cost_limits = {side: value - excess / 2.0
+                           for side, value in effective.items()}
+            if any(value <= 0 for value in cost_limits.values()):
+                cost_limits = {side: (1.0 - pair_margin) / 2.0
+                               for side in prepared}
+            for side, levels in prepared.items():
+                cost_limit = cost_limits[side]
+                ceiling = price_for_cost(levels[0].price, cost_limit)
+                shift = max(0.0, levels[0].price - ceiling)
+                prepared[side] = [QuoteLevel(price, level.shares)
+                                  for level in levels
+                                  if valid_price(price := floor_price(level.price - shift))
+                                  and effective_cost(price) <= cost_limit + 1e-12]
+
+    sized: dict[str, list[QuoteLevel]] = {"UP": [], "DOWN": []}
+    for side, levels in prepared.items():
+        remaining = capacities[side]
+        for level in levels:
+            quantity = min(level.shares, remaining)
+            if quantity * level.price + 1e-9 < min_order_cost:
+                continue
+            sized[side].append(QuoteLevel(level.price, quantity))
+            remaining = max(0.0, remaining - quantity)
+    quoted_cost = sum(level.price * level.shares
+                      for levels in sized.values() for level in levels)
+    scale = min(1.0, cash_budget / quoted_cost) if quoted_cost > 0 else 0.0
+    adjusted = {
+        side: [QuoteLevel(level.price, level.shares * scale) for level in levels
+               if level.price * level.shares * scale + 1e-9 >= min_order_cost]
+        for side, levels in sized.items()
+    }
+    final_cost = sum(level.price * level.shares
+                     for levels in adjusted.values() for level in levels)
+    mode = "close-only" if close_only else "two-sided"
+    return adjusted, (f"risk: {mode}; net={net:+.4f}; "
+                      f"paid={paid_cost:.2f}; bids={final_cost:.2f}")
+
+
+def fund_ladders(ladders: dict[str, dict[str, list[QuoteLevel]]], *,
+                 cash: float, market_budgets: Optional[dict[str, float]] = None,
+                 remaining_shares: Optional[dict[str, dict[tuple, float]]] = None,
+                 ) -> dict[str, dict[str, list[QuoteLevel]]]:
+    """Reserve cash across markets, nearest paired levels first, without resizing.
+
+    A 300-USDT account cannot fund the reference-sized full ladders. Omit deeper
+    levels rather than silently changing the observed share sizes or submitting
+    orders whose combined liability exceeds available collateral.
+    """
+    funded = {market_id: {"UP": [], "DOWN": []} for market_id in ladders}
+    remaining = max(0.0, cash) if isfinite(cash) else 0.0
+    spent = {market_id: 0.0 for market_id in ladders}
+    depth = max((len(levels) for ladder in ladders.values()
+                 for levels in ladder.values()), default=0)
+    for index in range(depth):
+        for market_id, ladder in ladders.items():
+            group = [(side, levels[index]) for side, levels in ladder.items()
+                     if index < len(levels)]
+            pending = (remaining_shares or {}).get(market_id, {})
+            cost = sum(level.price * pending.get((side, level.price), level.shares)
+                       for side, level in group)
+            cap = (market_budgets or {}).get(market_id, cash)
+            if (not isfinite(cost) or cost <= 0 or cost > remaining + 1e-9
+                    or spent[market_id] + cost > cap + 1e-9):
+                continue
+            for side, level in group:
+                funded[market_id][side].append(level)
+            remaining -= cost
+            spent[market_id] += cost
+    return funded
 
 
 def _equalise_shares(ladder: dict[str, list[QuoteLevel]],
@@ -270,18 +514,13 @@ def evaluate_rebalance_take(
     *,
     position: dict,
     risk_budget: float,
-    trigger_shares: float = 196.0,
+    trigger_shares: float = 0.0,
     take_shares: float = 10.0,
     min_order_cost: float = 1.0,
 ) -> tuple[Optional[Opportunity], str]:
-    """Take the under-weighted side once inventory drifts past the wallet's band.
-
-    Measured from the tracked wallet: it lets the net position run to a median of
-    196 shares before acting, then lifts only ~10 shares at a time. Balancing
-    sooner (a 20-share trigger taking 100 at once) flattened the book within
-    seconds, which the wallet never does and which pays the 2% taker fee far too
-    often.
-    """
+    """Optional paper-only inventory overlay; its trigger is user-defined."""
+    if trigger_shares <= 0:
+        return None, "rebalance: disabled"
     up = float(position.get("up_quantity", 0.0))
     down = float(position.get("down_quantity", 0.0))
     net = up - down

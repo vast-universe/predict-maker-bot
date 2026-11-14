@@ -15,8 +15,9 @@ book is acted on without polling. ``predictMarketChanged`` additionally forces a
 rediscovery when a round rolls over or resolves.
 
 ``websockets`` is optional: when it is missing the feed logs why and the scan
-keeps using the REST ``markets/quotes`` endpoint, which is also the fallback for
-any market whose streamed quote is older than ``quote_max_age``.
+keeps using REST ``markets/orderbooks``, which is also the fallback for any
+market whose streamed quote is older than ``quote_max_age``. Touch-only quotes
+are a final fallback when the full-book response omits a market.
 """
 
 import asyncio
@@ -57,6 +58,18 @@ class MarketSnapshot:
     # to detect fills, which price-only snapshots cannot reveal.
     up_bids: tuple = ()
     up_asks: tuple = ()
+    # Identify the actual book update, rather than the time this scan ran. Paper
+    # fills must not consume the same displayed liquidity on successive scans.
+    book_timestamp_ms: int = 0
+    is_neg_risk: bool = False
+    is_yield_bearing: bool = False
+    reward_spread_threshold: Optional[float] = None
+    reward_share_threshold: Optional[float] = None
+    up_token_id: Optional[str] = None
+    down_token_id: Optional[str] = None
+    # Only explicit fresh WebSocket whole-book data can prove no settlement is
+    # pending. REST omits this field, so unknown must remain None, never False.
+    settlements_pending: Optional[bool] = None
 
 
 def _levels(raw) -> tuple:
@@ -67,7 +80,7 @@ def _levels(raw) -> tuple:
             price, size = float(row[0]), float(row[1])
         except (TypeError, ValueError, IndexError):
             continue
-        if valid_price(price) and size > 0:
+        if valid_price(price) and isfinite(size) and size > 0:
             out.append((price, size))
     return tuple(out)
 
@@ -536,16 +549,35 @@ class PredictMarketFeed:
         }
         market_ids = [str(market["id"]) for market in self._markets]
         live_quotes = self._live_quotes(market_ids)
-        rest_quotes = {}
+        rest_books, rest_quotes = {}, {}
         missing_live = [market_id for market_id in market_ids if market_id not in live_quotes]
         if missing_live:
-            rest_quotes = self._rest_quotes(missing_live)
+            rest_books = self._rest_books(missing_live)
+            missing_books = [market_id for market_id in missing_live if market_id not in rest_books]
+            if missing_books:
+                rest_quotes = self._rest_quotes(missing_books)
         snapshots = []
         for market in self._markets:
             market_id = str(market["id"])
+            store = getattr(self.live, "store", None)
+            trading_status = str(getattr(store, "trading_status", {}).get(
+                market_id, market.get("trading_status", "OPEN"))).upper()
+            market_status = str(getattr(store, "market_status", {}).get(
+                market_id, market.get("status", "OPEN"))).upper()
+            if trading_status != "OPEN" or market_status in {"PAUSED", "CLOSED", "RESOLVED"}:
+                self.diagnostics.append(
+                    f"market={market_id} not tradable ({trading_status}/{market_status})")
+                continue
             live = live_quotes.get(market_id)
-            live_book = self.live.book_payload(market_id) if self.live is not None else None
+            # A stale socket's cached book must never be paired with a fresh
+            # REST quote. Keep price, depth and update identity from one source.
+            book = None
             if live is not None:
+                if self.live is not None:
+                    candidate = self.live.book_payload(market_id)
+                    book_at = int((candidate or {}).get("updateTimestampMs") or 0)
+                    if book_at and time.time() - book_at / 1000 <= self.quote_max_age:
+                        book = candidate
                 up_ask, down_ask = live.up_ask, live.down_ask
                 up_bid, down_bid = live.up_bid, live.down_bid
                 timestamp_ms = live.timestamp_ms
@@ -555,15 +587,27 @@ class PredictMarketFeed:
                     )
                     continue
             else:
-                quote = rest_quotes.get(market_id)
+                book = rest_books.get(market_id)
+                if book is not None:
+                    quote_from_book = BookQuote.from_orderbook(
+                        book, decimal_precision=int(market.get("decimal_precision", 3))
+                    )
+                    quote = {
+                        "bestAsk": {"price": quote_from_book.up_ask},
+                        "bestBid": {"price": quote_from_book.up_bid},
+                        "updateTimestampMs": quote_from_book.timestamp_ms,
+                    }
+                else:
+                    quote = rest_quotes.get(market_id)
                 if not quote:
                     self.diagnostics.append(f"market={market_id} missing quote response")
                     continue
                 up_ask = quote_price(quote.get("bestAsk"))
                 yes_bid = quote_price(quote.get("bestBid"))
                 up_bid = yes_bid
-                down_ask = round(1.0 - yes_bid, 6) if yes_bid is not None else None
-                down_bid = round(1.0 - up_ask, 6) if up_ask is not None else None
+                factor = 10 ** int(market.get("decimal_precision", 3))
+                down_ask = (factor - round(yes_bid * factor)) / factor if yes_bid is not None else None
+                down_bid = (factor - round(up_ask * factor)) / factor if up_ask is not None else None
                 timestamp_ms = quote.get("updateTimestampMs")
                 if up_ask is None and down_ask is None:
                     self.diagnostics.append(
@@ -586,6 +630,11 @@ class PredictMarketFeed:
                 if timestamp_ms
                 else datetime.now(timezone.utc).isoformat(timespec="seconds")
             )
+            pending = (book or {}).get("settlementsPending") if live is not None else None
+            pending_flag = None
+            if (isinstance(pending, dict) and isinstance(pending.get("asks"), list)
+                    and isinstance(pending.get("bids"), list)):
+                pending_flag = bool(pending["asks"] or pending["bids"])
             ends_at = market.get("ends_at")
             seconds_left = None
             if ends_at:
@@ -611,8 +660,16 @@ class PredictMarketFeed:
                     up_bid=up_bid,
                     down_bid=down_bid,
                     decimal_precision=int(market.get("decimal_precision", 3)),
-                    up_bids=_levels(live_book.get("bids") if live_book else None),
-                    up_asks=_levels(live_book.get("asks") if live_book else None),
+                    up_bids=_levels(book.get("bids") if book else None),
+                    up_asks=_levels(book.get("asks") if book else None),
+                    book_timestamp_ms=int((book or {}).get("updateTimestampMs") or 0),
+                    is_neg_risk=bool(market.get("is_neg_risk", False)),
+                    is_yield_bearing=bool(market.get("is_yield_bearing", False)),
+                    reward_spread_threshold=market.get("spread_threshold"),
+                    reward_share_threshold=market.get("share_threshold"),
+                    up_token_id=market.get("up_token_id"),
+                    down_token_id=market.get("down_token_id"),
+                    settlements_pending=pending_flag,
                 )
             )
         return snapshots
@@ -645,6 +702,16 @@ class PredictMarketFeed:
         """REST fallback for markets without a fresh streamed quote."""
         quotes = self._get("markets/quotes", {"ids": ",".join(market_ids)}).get("data", [])
         return {str(quote["marketId"]): quote for quote in quotes}
+
+    def _rest_books(self, market_ids: list[str]) -> dict[str, dict]:
+        """Fetch coherent full-book snapshots, up to 100 IDs per API request."""
+        books = {}
+        for start in range(0, len(market_ids), 100):
+            page = self._get(
+                "markets/orderbooks", {"ids": ",".join(market_ids[start:start + 100])}
+            ).get("data", [])
+            books.update({str(book["marketId"]): book for book in page})
+        return books
 
     def close(self) -> None:
         """Stop the WebSocket thread when the scan loop ends."""
@@ -715,15 +782,22 @@ class PredictMarketFeed:
         """Read any wallet's Predict positions; this endpoint only needs the API key."""
         positions = []
         cursor = None
+        seen_cursors = set()
         while True:
             params = {"first": "100", "isResolved": "false"}
             if cursor:
                 params["after"] = cursor
             payload = self._get(f"positions/{address}", params)
-            positions.extend(payload.get("data", []))
+            page = payload.get("data")
+            if not isinstance(page, list) or any(not isinstance(row, dict) for row in page):
+                raise RuntimeError("Predict positions returned an invalid page")
+            positions.extend(page)
             cursor = payload.get("cursor")
             if not cursor:
                 return positions
+            if not isinstance(cursor, str) or cursor in seen_cursors:
+                raise RuntimeError("Predict positions returned a repeated or invalid cursor")
+            seen_cursors.add(cursor)
 
     def _discover_markets(self) -> None:
         markets = []
@@ -731,7 +805,8 @@ class PredictMarketFeed:
         now = datetime.now(timezone.utc)
         for asset in self.assets:
             for window in self.windows:
-                slug = f"{asset.lower()}-updown-{window}m"
+                interval = {60: "1h", 1440: "1d"}.get(window, f"{window}m")
+                slug = f"{asset.lower()}-updown-{interval}"
                 rounds = self._get(f"series/{slug}/rounds", {"status": "ACTIVE", "first": "5"})
                 reasons = []
                 selected = None
@@ -753,6 +828,8 @@ class PredictMarketFeed:
                     for market in category.get("markets", []):
                         if market.get("tradingStatus") != "OPEN":
                             continue
+                        if str(market.get("status", "OPEN")).upper() in {"PAUSED", "CLOSED", "RESOLVED"}:
+                            continue
                         variant = market.get("variantData") or {}
                         if (market.get("marketVariant") != "CRYPTO_UP_DOWN"
                                 and variant.get("type") != "CRYPTO_UP_DOWN"):
@@ -770,6 +847,11 @@ class PredictMarketFeed:
                             continue
                         rewards = market.get("rewards") or {}
                         current_reward = rewards.get("current") or {}
+                        outcomes = market.get("outcomes") or []
+                        tokens = {
+                            outcome.get("indexSet"): str(outcome["onChainId"])
+                            for outcome in outcomes if outcome.get("onChainId") is not None
+                        }
                         selected = {
                             "id": market["id"], "asset": asset, "window_minutes": window,
                             "title": category.get("title") or market.get("title"),
@@ -778,6 +860,13 @@ class PredictMarketFeed:
                             "price_feed_provider": details.get("priceFeedProvider"),
                             "price_feed_symbol": details.get("priceFeedSymbol"),
                             "decimal_precision": int(market.get("decimalPrecision", 3)),
+                            "outcomes": outcomes,
+                            "isNegRisk": bool(market.get("isNegRisk", False)),
+                            "isYieldBearing": bool(market.get("isYieldBearing", False)),
+                            "is_neg_risk": bool(market.get("isNegRisk", False)),
+                            "is_yield_bearing": bool(market.get("isYieldBearing", False)),
+                            "up_token_id": tokens.get(1),
+                            "down_token_id": tokens.get(2),
                             "trading_status": market.get("tradingStatus", "OPEN"),
                             "status": market.get("status", "OPEN"),
                             # A market can be REGISTERED and still accept and match

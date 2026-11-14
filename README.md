@@ -1,146 +1,220 @@
-# Predict.fun Paper Trading Bot
+# Predict.fun Maker Bot
 
-A paper market maker for Predict.fun's crypto up/down markets, modelled on the
-behaviour of the wallet `0x5E498154448608C826E005c93533B827Cbb6377e`
-(`quantbarbie`, second on the season-2 points board, about $488k realised). It
-reads live quotes over Predict's WebSocket, rests a two-sided bid ladder, books
-simulated fills, and settles from Predict's own resolution endpoint. It never
-sends orders.
+本项目的当前策略是自研的 **buy-only 双边限价做市、持有至结算**：只买 Up / Down，
+不卖出，不通过主动吃 ask 的补仓路径强行配平。默认模拟运行，显式 `--live` 才发送真实订单。
 
-## Maker strategy (default)
+研究参考钱包：`0x5E498154448608C826E005c93533B827Cbb6377e`。
+用户确认其关注的最新版行为是 maker、只买不卖；这属于当前设计约束，
+不是本项目已取得该钱包私有源码或已独立验证其最新全部委托的证明。
+项目根据公开行为与风险假设自行实现，不能称为完整私有策略复刻，也不保证复制成交或收益。
 
-The behaviour below was measured from 4,200 of that wallet's fills across 27
-rounds, not guessed:
+## 历史样本与当前策略边界
 
-| Observed in the wallet | Value |
+2026-11-14 读取官方 `GET /v1/orders/matches?signerAddress=...` 的 3,000 条 match，
+覆盖 10:47:11–11:40:47 UTC（北京时间 18:47:11–19:40:47）。接口返回整笔交易，
+逐项过滤目标 signer 后得到 3,089 笔 fill：
+
+| 历史公开样本 | 结果 |
 | --- | --- |
-| Maker share of fills | 94.8% |
-| Quote side | 100% Bids, never Asks |
-| Two-sided markets | 26 of 26 |
-| Levels resting per side | 5 (deepest observed sweep took 5 ticks) |
-| Shares per level | 100 (lifetime volume per level is a multiple of 100) |
-| Tick spacing / top offset | 1 cent / 1 cent below the mid |
-| Bid offset from mid | 1.50 cents per side (both sides equal, spread 0.00) |
-| Refill of a taken level | median 8s, 30% within 2s |
-| Fills per round | 128 over 279s, 22.8 shares each, in ~15 bursts of ~9.8 |
-| Inventory | balanced by taking the short side: 196-share trigger, 10 shares a time |
-| Reward band | `spreadThreshold` 0.06, `shareThreshold` 100, `makerFeeBps` 0 |
+| 市场 | BTC 5 分钟、15 分钟；分别覆盖 12、4 个市场 |
+| Maker / taker | 2,882 / 207 笔，约 93.3% / 6.7% |
+| 买卖方向 | 100% Bid；Up、Down 均有成交 |
+| 价格 | 全部位于 1 美分网格，样本范围 0.02–0.98 |
+| Maker 单位 | 另取最近 1,500 条 match 按 order hash 聚合，5m 最常见为 100 股，15m 为 40 股 |
+| 手续费 | 样本 maker 费用为 0；taker 存在真实的股份扣费 |
 
-Each side rests five bids one cent apart starting one cent under its own mid, so
-a matched pair costs `1 - 2 * 1c`. A level is refilled once the mid stops moving
-and abandoned once it drifts. Inventory is balanced by lifting the offer on the
-under-weighted side and paying the 2% taker fee, at the wallet's own thresholds.
+这些是有起止时间的历史样本，保留其中 taker 记录不代表最新版仍采用主动补仓。
+所有目标订单均为 LIMIT；maker / taker 描述撮合角色，marketable LIMIT 也能成为 taker。
+100 / 40 股是典型已成交总量，不是公开可读的完整原始挂单；部分订单可能尚未成交完毕或被样本截断。
+公开成交不包含全部未成交委托、撤单与模型输入，不能推导私有阈值。
 
-Fills are modelled from book depth, not from price crossing: our simulated order
-is not in the real book, so a print at our tick is split by queue share, using
-the measured median resting depth (269 shares) rather than the often-drained
-instant depth. Price-crossing rules were tried and gave every pair exactly 1.00.
+## 自研报价与风险规则
 
-Current fidelity against the same measurements:
+Up / Down 均提交 BUY LIMIT；Down 买单在 Yes 书中对应互补价格的卖方流动性。
+报价以各自 mid 向下对齐市场 tick，默认顶档低于 mid 1 美分、档间距 1 美分、每侧最多 5 档，
+并低于生成报价时可见的对手 ask。默认报价范围为 0.01–0.99，低于 1 USDT 最低订单金额的档位省略。
+这些报价参数是实现假设，不是已恢复的目标钱包参数。
 
-| Metric | Bot | Wallet |
-| --- | --- | --- |
-| Shares per burst | 79 | 79 |
-| Shares per side per round | 1,185 | 1,457 |
-| Median fill | 17.7 shares | 22.8 |
-| Pair cost (2s window) | 0.9709 | 0.9630 |
-| Up/Down ratio per round | 0.79 | 0.997 median (0.17-1.62 across rounds) |
+| 规则 / CLI | 默认值及实际含义 |
+| --- | --- |
+| `--assets` / `--windows` | BTC / 5,15 |
+| `--level-shares` / `--15m-level-shares` | 100 / 40 股基准；风险规则可以裁剪，最终不保证每档都是该尺寸 |
+| `--starting-cash` | 300 USDT；既是新模拟账本初始现金，也是两种模式的全账户已部署成本上限 |
+| `--max-net-shares` | 200 股；约束某一侧未成交买单全部成交时的最坏单边库存 |
+| `--pair-margin` | 0.02 USDT / 配对净股；约束拟议双边价格与已有缺口补对成本，不保证双边均能成交 |
+| `--max-market-cost` | 250 USDT；单市场已有持仓支付成本加全部待成交买单金额的上限 |
+| `--stop-new-seconds` | 距结束 60 秒内只允许买缺少侧，数量不超过现有净缺口，且满足配对成本条件；库存已平衡时不再买入 |
+| `--stop-all-seconds` | 距结束 10 秒内停止新增并尝试撤销全部未成交买单，已有持仓继续等结算 |
+| `--shock-cents` / `--shock-cooldown` | 相邻扫描 mid 变动达到 12 美分时撤单，冷却 10 秒；陈旧/缺失行情也撤单并进入冷却 |
+| 行情新鲜度 | 默认最多 15 秒；过期、缺失或无法解析的快照不继续报价 |
+| `--replenish-delay` / `--skew-cents` | 默认 0 秒 / 0；可选补单等待与库存价格偏移 |
+| `--rebalance-trigger` | 必须为 0；非零直接拒绝，主循环没有主动吃 ask 再平衡路径 |
 
-The Up/Down ratio looks unbalanced taken alone, but the wallet's own per-round
-ratio spans 0.17 to 1.62 with a p25 of 0.909, so a single round at 0.79 sits well
-inside its distribution: the wallet lets exposure run (median 196 shares before
-it acts, 200 after) rather than keeping the book flat.
+风险处理先按库存净额裁剪股数、移动配对价格并约束单市场成本。
+随后 `fund_ladders` 用同一个全账户预算按较近深度优先选择各市场档位；
+资金不足时省略档位，**不再缩小已经过风险处理的股数**。
+`--level-notional` 默认为 0；设为正数会改用可选金额定仓，改变 100 / 40 股基准行为。
 
-What still differs is fill granularity: one 6s snapshot books fewer, smaller
-fills than the wallet's continuous stream. That is a limit of paper fill
-simulation rather than of the strategy, since a real order sits inside the book
-and is matched by time priority, which a simulated order cannot observe.
+全账户新增买单空间为：
 
-Known gaps: maker rewards (`hourlyRate` 3000 per market) are not credited, only
-the time a reward-qualified ladder rests is tracked; slippage, order latency and
-partial-fill risk are not modelled.
+```text
+模拟：min(模拟可用现金, max(0, starting_cash - 全部未结算持仓已支付成本))
+实盘：min(链上可用 USDT, max(0, starting_cash - 全账户未结算持仓成本))
+```
 
-## Directional strategy (optional, `--mode taker`)
+所有市场共同分配这个空间，保留订单的剩余量及尚未完成对账的预留继续占用资金。
+已配成对但仍持有的 shares 不会提前释放成本预算；本项目不自动 merge。
+已有外部仓位超过阈值时，策略只能限制新增并尝试挂缺少侧，不能通过卖出止损。
 
-`--mode taker` keeps the earlier directional entry strategy: it estimates the
-chance the round closes up, compares that against the fee-inclusive ask, and
-requires a 3-cent edge per share. It targets 10 net shares, reserves cash for an
-equal-size hedge, and can trim the unmatched leg once the opposite quote is rich.
-Missing quotes never create an executable price.
+## 运行
 
-## Run
+在项目目录中安装现有依赖，使用默认模拟模式：
 
 ```bash
-cd predict-maker-bot
+.venv/bin/python -m pip install -r requirements.txt
 .venv/bin/python main.py
 ```
 
-That rests the maker ladder on BTC's 5-minute round with a $10,000 paper balance.
-A fresh `--data-dir` is needed to pick up a new starting balance, since an
-existing ledger keeps its own cash:
- To follow more series, name ones that exist (`GET /v1/series` lists `btc/eth/bnb-updown-{5m,15m,1h,1d}` plus stock and commodity 15m/1d slugs; there is no SOL or XRP series):
+`Ctrl+C` 停止；只扫描一轮：
 
 ```bash
-python3.13 main.py --assets BTC,ETH,BNB --windows 5,15
+.venv/bin/python main.py --cycles 1
 ```
 
-To start a separate $100 paper ledger with a base target of 10 net shares:
+显式写出主要默认风险参数：
 
 ```bash
-python3.13 main.py --shares 10 --starting-cash 100 --data-dir paper_data_small
+.venv/bin/python main.py --assets BTC --windows 5,15 \
+  --level-shares 100 --15m-level-shares 40 --starting-cash 300 \
+  --max-net-shares 200 --pair-margin 0.02 --max-market-cost 250 \
+  --stop-new-seconds 60 --stop-all-seconds 10 \
+  --shock-cents 12 --shock-cooldown 10
 ```
 
-With the default 10% exposure limit, a $100 paper account has $10 for open cost plus hedge reserves. Low-priced entries may require substantially more hedge reserve than entry cash and will be skipped if unaffordable. `--starting-cash` does not reset existing ledger balances; use a new `--data-dir` for a fresh simulation. The default starting cash remains $1,000.
+`--interval` 默认 12 秒，是扫描等待上限，WebSocket 更新可提前唤醒；
+`--min-scan` 默认 1 秒。`--offset`、`--levels`、`--quote-min`、`--quote-max`
+分别调整顶档偏移、档数与报价范围。当前入口没有 `--mode taker` 或 SELL 策略。
 
-Sizing uses `net_quantity = max(base_shares, ceil($1 / cost_per_net_share))`, followed by the gross/net fee conversion. For example, at a 200 bps fee rate, asks of $0.07, $0.06, $0.04, $0.03, and $0.02 target 14, 17, 25, 33, and 49 net shares respectively. Gross order sizes are larger; each order's cash value is at least $1. These are sizing examples, not automatic buy signals.
+配置从现有 `.env` 与环境变量读取。行情需要 `PREDICT_API_KEY`；实盘还需要
+`PREDICT_ACCOUNT_ADDRESS`、`PRIVY_WALLET_PRIVATE_KEY`。
+参考钱包只标识研究对象，不会替换用户自己的交易账户，不需要参考钱包的私钥。
 
-By default the bot tracks BTC on the 5-minute window. Override with `--assets BTC,ETH,BNB --windows 5,15`; the slug must exist as a Predict series (`GET /v1/series`), otherwise discovery reports no eligible round for it. Quotes arrive over the Predict WebSocket (`wss://ws.predict.fun/ws`): the bot subscribes to `predictOrderbook/{marketId}`, `predictTradingStatus/{marketId}`, `predictMarketStatus/{marketId}` and `predictMarketChanged/{marketId}` for every tracked round, and rediscovers active rounds every 10 seconds or immediately when a `predictMarketChanged` notice arrives. Scans are push driven: the loop blocks until the socket delivers a message, then rescans after a short debounce, so it never waits out the full interval while a fresh book sits unused. `--interval` is the maximum wait and `--min-scan` the minimum gap between pushed scans. If the socket is down, missing, or a market has no quote younger than 15 seconds, that market falls back to the REST `markets/quotes` endpoint for the scan. Press `Ctrl+C` to stop it. To run one scan only, use `--cycles 1`; use `--interval 10` to cap pushed rescans at 10 seconds. The bot reads live Predict.fun quotes with the configured `PREDICT_API_KEY`; there is no offline source.
+## 行情、模拟与结算
 
-### Live market data (WebSocket)
+行情优先来自 `wss://ws.predict.fun/ws`，订阅订单簿、交易状态、市场状态及市场变化，
+处理心跳、断线重连与重新订阅。缺少新鲜 WebSocket 报价时，
+通过 `GET /v1/markets/orderbooks` 读取完整 REST 书；缺少该市场时才回退到 touch quote。
+REST 不混用旧 socket 深度；市场发现保留 outcome token、风险标志、奖励门槛和书时间戳。
+暂停、只允许撤单、关闭或已结算市场停止报价，实盘尝试撤掉本进程挂单。
 
-* Endpoint: `wss://ws.predict.fun/ws` (BNB mainnet only), API key sent as the `x-api-key` handshake header.
-* Topics: `predictOrderbook/{marketId}` (whole Yes book per message), `predictTradingStatus/{marketId}`, `predictMarketStatus/{marketId}` and `predictMarketChanged/{marketId}`. `predictTopOfBook/{marketId}` is also supported by the client when only best prices are needed.
-* The latest value of each topic is sent right after the subscribe response; every message is a full snapshot, so the newest one replaces the previous copy.
-* `heartbeat` arrives every 15 seconds and must be echoed back with the same `data`, otherwise the server closes the connection. On `system` reconnect notices and any other close, the client reconnects with backoff, resubscribes, and the scan refetches quotes from REST until the stream is fresh again.
-* The book frame carries no `decimalPrecision`, so the value discovered over REST is kept per market id and used to derive the Down side: Down ask = `1 - best Yes bid`, Down bid = `1 - best Yes ask`. Without that, a market with two decimals would be complemented at the wrong tick size.
-* `predictMarketChanged` forces a rediscovery (throttled to one per 2 seconds) so a rolled or resolved round is replaced without waiting for the 10-second TTL.
-* The scan loop waits on the socket: a pushed message ends the wait, then `scan_debounce` lets a burst settle before pricing. Settlement and account reads stay on the slower `--interval` cadence so the hot path is stream-only.
-* `websockets` is required for streaming (`pip install -r requirements.txt`). Without it the bot logs the reason and keeps scanning on REST quotes.
+模拟仍使用既有 ask-crossing 近似：挂出买单后，后续新完整书出现 `ask <= 限价` 时，
+按剩余股数、可用深度与现金限额产生部分成交。相同或更旧的 `book_timestamp_ms` 不重复消费，
+初次挂单之前的书、过期书和无深度 quote 不产生整档成交。
+跳价前已挂出的单可能在撤单前成交；模拟先记已有委托的成交，再应用 shock 撤单，不能抹掉不利成交。
+订单簿变化无法证明真实成交或本策略排队位置，因此这是本地模型，不能当作真实回测或收益保证。
 
-### Console output
+账本沿用 `<data-dir>`，默认 `paper_data/`：`portfolio.json` 保存现金与仓位，
+`pnl_log.csv` 记录模拟成交和结算，`pnl_summary.txt` 提供汇总。
+`--starting-cash` 不重置已有账本余额，但仍决定本次运行的全局成本上限。
+策略修改不清空旧账本。模拟只在官方 `RESOLVED` 后按赢家份额结算；50/50 每边按 0.5。
+奖励只记录符合市场价差、股数门槛的挂单时间，不把积分或预估奖励记为现金。
 
-Each scan prints a cycle banner carrying the stream status, then one line per asset (`[BTC] Bitcoin Up or Down - ... @5s [1/1] - 6 sig`), then executes the whole batch of orders in parallel:
+## 收益分解与不同行情
 
+设净持仓为 `qU / qD`，真实支付成本为 `CU / CD`，`P=min(qU,qD)`。
+按各侧平均成本分摊 `paired_cost`，其余为 `unpaired_cost`，结算收益为：
+
+```text
+PnL = P - paired_cost + 未配对持仓的结算支付 - unpaired_cost
+结算最差收益下界 = min(qU,qD) - CU - CD
+结算最好收益上界 = max(qU,qD) - CU - CD
 ```
---- Cycle 11989 ---  ws=live msgs=2310 reconn=0 last=0.1s
-[BTC] Bitcoin Up or Down - March 13, 10:35AM-10:40AM ET @5s [1/1] - 6 sig
-* Executing 2 orders in parallel...
-[PAPER] BUY Up @ 0.36 x 5.9 (~$2.13) - dir Up@0.362
-[PAPER] SELL Up @ 0.36 x 13.0 (~$4.68) - rebal sell_up@0.36 down>0.64
-```
 
-The banner reports `ws=live msgs=<frames> reconn=<reconnects> last=<seconds since the last frame>`, or `ws=down rest-fallback` / `ws=off` when the stream is unavailable and quotes come from REST. The bracketed `[quoted/scanned]` counts markets with both sides quoted.
+终端的 `settlePnL=[下界,上界]` 是整个库存的结算区间，**不是仅计算配对部分的利润**。
+未配对仓位可能亏掉全部买入成本，配对部分为正也不代表整体盈利。
+以下均为零奖励、未计 gas 的人工会计案例，不是历史回测或策略收益预测：
 
-Order kinds in the `[PAPER]` line: `dir` (directional entry), `hedge` (profit-lock on the opposite side), `arb` (buy both legs when `comb=1.0xx` clears the configured pair edge, printed as one line per leg), and `rebal sell_up/sell_down` (trim the unmatched leg once the opposite quote crosses `rebalance_trigger`). Only cycle banners, asset lines, the parallel-execution banner, and fills go to the terminal; skips, hedge/rebalance waits, feed diagnostics, and settlement details are kept off the console.
+| 行情 / 人工成交输入 | 结算与结果 | 对策略的含义 |
+| --- | --- | --- |
+| 震荡：U100@0.47、D100@0.47 | 任意胜方，总收益 +6 USDT | 只有两边实际成交后，100 对 shares 才覆盖 94 成本 |
+| 单边上涨：U20@0.47、D100@0.47 | Up 赢；配对 +1.2、Down 残仓 -37.6，总收益 -36.4 | 便宜侧持续成交会造成逆向选择；限制库存并不消除方向风险 |
+| 瞬间跳水：U100@0.48、D20@0.48 | Down 赢；配对 +0.8、Up 残仓 -38.4，总收益 -37.6 | shock 撤单不能撤销已经成交的风险 |
+| 昂贵补对：U100@0.48、D100@0.70 | 总收益固定 -18 | 补齐数量不等于锁利；新的配对成本规则应阻止这类计划补单 |
+| 低流动：未出现可用的后续穿价深度 | 本地模型可以零成交、零交易收益 | 不把挂单或奖励资格当成成交利润，真实排队仍可能更差 |
+| 尾盘单腿：U60@0.40、D0 | Up 赢 +36，Down 赢 -24，50/50 +6 | 结束前撤单不改变已经买入的结算敞口 |
+| 跨市场：余额 100，A/B 各欲挂 U100、D100@0.47 | 总需求 188，必须省略部分档位 | 不能让不同市场重复承诺同一余额 |
 
-The continuous scan loop reads market data and records paper fills. Its paper ledgers are stored directly in `<data-dir>/`: `pnl_log.csv` records every simulated fill and settlement result (`SELL_UP`/`SELL_DOWN` rows carry negative cost as proceeds), and `portfolio.json` aggregates open Up/Down inventory and unmatched cost by market. Existing ledgers are migrated from fill history when the unmatched cost field is missing. Once Predict marks a market `RESOLVED`, the loop reads outcome statuses, credits the simulated payout, records realized P&L, and releases simulated exposure. This does not redeem or trade any real positions.
+此外，将样本扩大至 7,500 条 match、过滤目标地址后取得 7,744 笔 fill，
+覆盖 2026-11-14 09:25:00–11:58:29 UTC（北京时间 17:25:00–19:58:29）。
+对其中 38 个完整、已结算轮次做成交重建：以毛成交股数乘各实体成交价累加成本，
+扣除股份手续费后计算净股数，再按官方胜方支付，得到 20 轮为正、18 轮为负，合计 -479.6321844 USDT。
+其中两个反例为：
 
-`pnl_summary.txt` beside the ledger mirrors the console layout: a `# P&L Summary — ...` header, `Settled markets`, `Total cost`, `Total payout`, `Realized P&L`, then one `--- <N>-min markets ---` block per window with a `Count | Cost | Payout | P&L` line and the per-market `Title → winner  +$0.48` results. Unlike the earlier version it no longer appends paper-position and account sections; open inventory stays in `portfolio.json` and `pnl_log.csv`.
+| 市场 ID | Up / Down 净成交股数 | 重建成本 | 结算胜方 | 重建成交收益 |
+| --- | --- | --- | --- | --- |
+| 4532206 | 4032.7689816 / 3921.62301976 | 4030.95611332 | Down | -109.33309356 USDT |
+| 4532584 | 2676.5854465 / 2676.5798807 | 2878.15458834 | Up | -201.56914184 USDT |
+
+这里的数量是样本成交净流量，收益是**成交重建值，不是账户实际净收益**：
+未核对奖励、返佣、转账和其他非成交持仓流量，不能据此宣称目标账户整体亏损。
+它也说明不能预设参考钱包在每轮、每种行情都盈利，更不能只看双边数量接近就推断锁利。
+
+实盘持仓可能包含股份形式的 maker rebate 或外部转入，因此真实库存风险区间可能涵盖这些来源；
+它不等于已剔除奖励的策略收益。项目没有证明该策略在不同行情下具有正期望。
+
+模拟账本优先使用逐次买入维护的未配对成本；实盘聚合 positions 无法恢复历史批次时，
+缺口成本采用持仓较重一侧的加权买入均价。这是成本分配假设，不是已核实的钱包配对批次。
+
+## 实盘执行边界
+
+仅显式 `--live` 进入真实委托路径：
 
 ```bash
-python3 main.py --cycles 1
+.venv/bin/python main.py --live
 ```
 
-Ledger files sit directly in `paper_data/`: `pnl_log.csv`, `pnl_summary.txt`, and `portfolio.json`. Market discovery skips expired or future rounds and continues past candidates without a start price to find an eligible current round. To keep the console short, only the cycle banner, per-asset lines, and `[PAPER]` fills are printed.
+按用户要求，实盘设置 `strategy: LIMIT`、`isPostOnly: false`、
+`selfTradePrevention: CANCEL_TAKER`。策略意图是提供买方流动性，**执行设置不能保证纯 maker**：
+限价单在传输期间可能变成可成交单，产生 taker 成交与手续费。
+报价风控按潜在 taker 手续费计算净到账股数及配对成本；这不代表重新启用主动吃 ask 补仓。
 
-## Modules
+启动时若账户已有 OPEN 委托则拒绝继续；运行中只管理本进程创建的 hash / ID。
+每轮完整分页读取全账户未结算 positions，按 `market.id + outcome.onChainId` 识别仓位：
+`amount / 10^18` 为股数，`averageBuyPriceUsd` 为每股均价，二者相乘为当前持仓成本。
+所有未结算市场的成本都占用全局上限，包括当前没有报价的市场。
 
-- `main.py`: scan loop, WebSocket-driven wakeups, and paper-only orchestration.
-- `markets.py`: Predict.fun market discovery, the real-time WebSocket feed (order book, top of book, trading status, market changed, heartbeats, reconnect, push wakeups), live quotes, and market snapshots.
-- `strategy.py`: minimum-order sizing, directional entries, profit-lock hedging, Predict fees, and hedge reserves.
-- `trader.py`: paper fill logging.
-- `paper_portfolio.py`: simulated cash, exposure, deduplication, and ledger persistence.
-- `config.py`: base share quantity, edge thresholds, cash limits, and exposure cap.
+真实订单状态、终态成交和净库存共同对账。`FILLED`、`CANCELLED`、`EXPIRED` 等终态也读取完整成交，
+按 settlement 身份去重，扣除股份手续费后计算净到账量，不把毛成交量当作真实持仓。
+启动持仓作为基线，本进程已确认成交只用于检查 positions 索引是否追上，不再重复加仓。
+库存快照滞后、数据不全、状态未知或余额读取失败时撤单并停止新增，不能把缺失数据当成零仓位。
 
-The strategy reference material is [BTC 5-minute strategy](https://polymtradebot.com/blog/btc-up-or-down-5-minutes-strategy), [BTC 15-minute strategy](https://polymtradebot.com/blog/btc-up-or-down-15-minutes-strategy), [Predict.fun resolution rules](https://dev.predict.fun/concepts/resolution), and [Predict.fun fee schedule](https://docs.predict.fun/the-basics/predict-fees-and-limits).
-# predict-maker-bot
+未变化订单保留排队位置，部分成交保留剩余量；改价/改量先撤旧单，并核实撤单返回确认。
+撤单未确认、移除锁定或提交结果不确定时保留预留与原 hash 对账，不盲目重发。
+取消确认或部分成交后的终态仍可能有待链上结算量，不能立即释放剩余预留。
+`MarketSnapshot.settlements_pending` 只接受显式、新鲜 WebSocket 完整书中的 pending 字段；
+`LiveBook.observe_pending` 要求市场 pending-clear 的书时间戳晚于首次终态观察和取消确认，
+随后再经 GET 确认终态、完整成交与新一轮 positions 核对通过，才允许释放对应预留。
+REST-only、缺字段、旧书都不算 pending-clear，因此可能持续暂停重挂，直到有效 WS 观察，
+或已知终态且成交明确的市场经官方确认结算。仍 OPEN、订单或成交未知时，即使市场 resolved 也不释放。
+这是依靠全市场 pending 状态的保守限制；当前未实现 wallet events 的逐笔结算跟踪。
+退出或行情失效会尝试撤单，网络与移除锁可能使撤单无法即时完成。
+
+实盘不使用模拟成交或模拟结算，也没有自动真实赎回、合并、拆分或审批交易。
+本次仅进行离线检查、mock 回归与公开 GET 查询，未发送真实委托，未完成真实实盘验证。
+
+## 模块与官方参考
+
+- `config.py`：报价、风险、参考钱包与环境变量配置。
+- `markets.py`：发现、WebSocket / REST、完整分页 positions 与结算查询。
+- `strategy.py`：buy-only 梯队、库存/配对/尾盘风控及全账户配资。
+- `paper_portfolio.py`：模拟挂单、部分成交、账本、奖励计时与结算。
+- `trader.py`：实盘签名、真实订单/净成交/库存对账、资金预留与局部撤换。
+- `main.py`：唯一 maker 循环、模式隔离、行情保护与预算生命周期。
+
+参考：[公开成交](https://dev.predict.fun/api/orders/get-order-match-events)、
+[本人订单](https://dev.predict.fun/api/orders/get-orders)、
+[按地址持仓](https://dev.predict.fun/api/positions/get-positions-by-address)、
+[持仓单位与支付](https://dev.predict.fun/concepts/positions)、
+[订单簿](https://dev.predict.fun/concepts/order-book)、
+[做市与 post-only](https://dev.predict.fun/trading/market-making)、
+[手续费](https://dev.predict.fun/trading/fees)、[结算](https://dev.predict.fun/concepts/resolution)。

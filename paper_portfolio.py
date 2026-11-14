@@ -40,6 +40,8 @@ class RestingLevel:
     shares: float
     filled: bool = False
     placed_at: float = 0.0
+    filled_at: float = 0.0
+    target_shares: float = 0.0
 
 
 @dataclass
@@ -54,6 +56,7 @@ class MakerQuoteState:
     reward_share_seconds: float = 0.0  # qualified shares x seconds, for pool share
     last_bids: dict = field(default_factory=dict)   # side -> {price: size}
     last_asks: dict = field(default_factory=dict)
+    last_book_timestamp_ms: int = 0
 
     def unfilled(self, side: str | None = None) -> list[RestingLevel]:
         return [
@@ -77,7 +80,7 @@ class PaperPortfolio:
     account_positions_error: str | None = None
     maker_quotes: dict[str, MakerQuoteState] = field(default_factory=dict)
     maker_fills: list[dict] = field(default_factory=list)
-    replenish_delay: float = 8.0  # wallet refills a taken tick after ~8s (median)
+    replenish_delay: float = 0.0
 
     def __post_init__(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
@@ -262,179 +265,98 @@ class PaperPortfolio:
         *,
         mid_up: float,
         requote_ticks: int = 1,
-        replenish_delay: float = 8.0,
+        replenish_delay: float = 0.0,
         now: float | None = None,
     ) -> bool:
-        """Rest (or re-quote) the two-sided ladder for one market.
+        """Reconcile funded quotes while retaining unchanged price-time priority.
 
-        Returns True when the ladder was replaced. The ladder is replaced only
-        after the mid moves at least ``requote_ticks`` ticks, mirroring the
-        wallet's measured behaviour (it re-quotes on drift, not on every tick).
+        Partial orders keep their remaining quantity; only fully filled orders
+        are replenished. The optional delay starts at the fill, not placement.
         """
         now = time.monotonic() if now is None else now
         precision = max(0, int(getattr(snapshot, "decimal_precision", 3)))
         tick = 10 ** -precision
         state = self.maker_quotes.get(snapshot.market_id)
+        if state and abs(mid_up - state.mid_up) / tick + 1e-9 < max(1, requote_ticks):
+            mid_up = state.mid_up
         fresh = {
             (side, round(level.price, precision)): level.shares
             for side, side_levels in ladder.items()
             for level in side_levels
         }
-        if state is not None:
-            drifted = abs(mid_up - state.mid_up) / tick
-            if drifted + 1e-9 < max(1, requote_ticks):
-                # The mid has not moved, so the ladder shape still holds: refill
-                # any level that was taken, keeping the rest untouched. Waiting
-                # for the whole ladder to empty would leave a visible hole in the
-                # quote after a single fill, which the wallet never shows (it
-                # refills a taken tick within seconds).
-                replenished = False
-                for level in state.levels:
-                    key = (level.side, round(level.price, precision))
-                    if key not in fresh:
-                        continue
-                    if not (level.filled or level.shares + 1e-9 < fresh[key]):
-                        continue
-                    # A re-placed order is not instantly live: the venue's speed
-                    # bump delays removal and re-entry. Without a cooldown one
-                    # tick could be eaten and refilled several times a second,
-                    # which pushed the fill rate to 213/min against the wallet's
-                    # 33/min.
-                    if level.placed_at and now - level.placed_at < replenish_delay:
-                        continue
-                    level.filled = False
-                    level.shares = fresh[key]
-                    level.placed_at = now
-                    replenished = True
-                if replenished or state.unfilled():
-                    return replenished
-        # placed_at stays 0 on a fresh ladder: a newly rested order is live at
-        # once, and only a *replacement* has to wait out the venue's delay.
-        levels = [
-            RestingLevel(side=side, price=level.price, shares=level.shares)
-            for side, side_levels in ladder.items()
-            for level in side_levels
-        ]
+        existing = {(level.side, round(level.price, precision)): level
+                    for level in state.levels} if state else {}
+        levels = []
+        changed = set(existing) != set(fresh)
+        for (side, price), shares in fresh.items():
+            old = existing.get((side, price))
+            if old is not None and abs((old.target_shares or old.shares) - shares) <= 1e-9:
+                if not old.filled:
+                    levels.append(old)
+                    continue
+                if now - old.filled_at < replenish_delay:
+                    levels.append(old)
+                    continue
+            levels.append(RestingLevel(side=side, price=price, shares=shares,
+                                       placed_at=now, target_shares=shares))
+            changed = True
         carried = state or MakerQuoteState(market_id=snapshot.market_id, mid_up=mid_up)
         self.maker_quotes[snapshot.market_id] = MakerQuoteState(
             market_id=snapshot.market_id, mid_up=mid_up, levels=levels, quoted_at=now,
             reward_seconds=carried.reward_seconds,
             reward_share_seconds=carried.reward_share_seconds,
             last_bids=carried.last_bids, last_asks=carried.last_asks,
+            last_book_timestamp_ms=max(carried.last_book_timestamp_ms,
+                                      getattr(snapshot, "book_timestamp_ms", 0)),
         )
-        return True
-
-    def _next_tick_down(self, side: str, tick: float, precision: int) -> float | None:
-        """The tick immediately below `tick` on the same side, or None."""
-        step = 10 ** -precision
-        lower = round(tick - step, precision)
-        return lower if lower > 0 else None
-
-    def _traded_shares(self, state: "MakerQuoteState", snapshot) -> tuple[dict, dict]:
-        """Shares that traded per price level since the previous book snapshot.
-
-        Down-side levels are derived from the Yes book: a Down bid at p is a Yes
-        ask at 1-p, so Down depth is read off the mirrored Yes side. Returns the
-        traded amounts and the depth that stood before this snapshot, which is
-        what sets our queue share.
-        """
-        precision = max(0, int(getattr(snapshot, "decimal_precision", 3)))
-        total_ticks = 10 ** precision
-        books = {"UP": snapshot.up_bids, "DOWN": snapshot.up_asks}
-        traded: dict[str, dict[float, float]] = {}
-        previous_depth: dict[str, dict[float, float]] = {}
-        current_depth: dict[str, dict[float, float]] = {}
-        for side, levels in books.items():
-            current: dict[float, float] = {}
-            for price, size in levels or ():
-                ticks = round(price * total_ticks)
-                if side == "DOWN":
-                    ticks = total_ticks - ticks
-                current[round(ticks / total_ticks, precision)] = size
-            previous = state.last_bids if side == "UP" else state.last_asks
-            previous_depth[side] = dict(previous)
-            if previous:
-                for price, before in previous.items():
-                    after = current.get(price, 0.0)
-                    if before - after > 1e-9:
-                        traded.setdefault(side, {})[price] = before - after
-            current_depth[side] = dict(current)
-            if side == "UP":
-                state.last_bids = current
-            else:
-                state.last_asks = current
-        return traded, previous_depth, current_depth
+        return changed
 
     def collect_maker_fills(self, snapshot, *, budget: float | None = None) -> list[RestingLevel]:
-        """Fill a resting bid when price-time priority reaches it.
+        """Approximate passive fills from a NEW full book's crossing liquidity.
 
-        The venue matches price first, then time. Our order is not in the real
-        book, so the depth we can see at our tick is entirely ahead of us: those
-        orders were resting before ours. We therefore only trade once that depth
-        has been taken out, which the book shows as the tick going to zero with a
-        print behind it. The whole level fills at that point, up to what printed.
-
-        Nothing else is capped. Earlier versions limited fills per snapshot, levels
-        per snapshot and distance from the touch, and split each print
-        proportionally; those numbers were fitted so the summary would resemble
-        the wallet's and are not how an exchange matches.
+        Retain the existing ask-crossing model, including complementary BUYs,
+        but consume each visible share at most once and allow partial fills.
+        Top-of-book prices alone cannot justify an unlimited full-ladder fill.
+        This is a paper approximation, not proof a real queue would fill.
+        ``budget`` limits additional cash spent, not lifetime committed cost.
         """
         state = self.maker_quotes.get(snapshot.market_id)
         if state is None:
             return []
-        traded, previous_depth, current_depth = self._traded_shares(state, snapshot)
+        timestamp = getattr(snapshot, "book_timestamp_ms", 0)
+        if timestamp <= state.last_book_timestamp_ms or timestamp <= 0:
+            return []
+        state.last_book_timestamp_ms = timestamp
         precision = max(0, int(getattr(snapshot, "decimal_precision", 3)))
-        committed = float((self.open_positions.get(snapshot.market_id) or {}).get("cost", 0.0))
+        liquidity = {
+            "UP": [[float(price), float(size)] for price, size in snapshot.up_asks],
+            "DOWN": [[round(1.0 - float(price), precision), float(size)]
+                     for price, size in snapshot.up_bids],
+        }
+        for side in liquidity:
+            liquidity[side].sort(key=lambda row: row[0])
+        available = max(0.0, min(self.cash, budget if budget is not None else self.cash))
         now_mono = time.monotonic()
         fills = []
-        for level in state.unfilled():
-            tick = round(level.price, precision)
-            if level.placed_at and now_mono - level.placed_at < self.replenish_delay:
-                continue
-            depth_before = previous_depth.get(level.side, {}).get(tick, 0.0)
-            if depth_before <= 1e-9:
-                # Nothing rested ahead of us, so there is no queue to clear and we
-                # cannot tell from a depth delta that our own order traded.
-                continue
-            depth_after = current_depth.get(level.side, {}).get(tick, 0.0)
-            if depth_after > 1e-9:
-                # Someone is still resting at our price: time priority has not
-                # reached us yet.
-                continue
-            traded_at_level = traded.get(level.side, {}).get(tick, 0.0)
-            if traded_at_level + 1e-9 < depth_before:
-                # The depth shrank but the tick did not clear in one print, so the
-                # clearing we see is cancellations rather than a sweep.
-                continue
-            # Once our tick clears the book shows only zero, not how much traded
-            # there. The next tick down is the only evidence of whether a sweep
-            # actually ran through our price or the queue merely cancelled out: a
-            # sweep that reaches us also takes liquidity below us.
-            lower = self._next_tick_down(level.side, tick, precision)
-            lower_traded = traded.get(level.side, {}).get(lower, 0.0) if lower is not None else 0.0
-            if lower_traded <= 1e-9:
-                # Our tick emptied without the book below moving, so this reads as
-                # a cancel rather than a print through us; we did not trade.
-                continue
-            # The sweep cleared the queue ahead and reached the level below, so it
-            # filled our whole level.
-            quantity = level.shares
+        for level in sorted(state.unfilled(), key=lambda value: -value.price):
+            quantity = 0.0
+            for row in liquidity.get(level.side, []):
+                price, size = row
+                if price > level.price + 1e-12:
+                    break
+                matched = min(size, level.shares - quantity, available / level.price)
+                if matched <= 1e-9:
+                    continue
+                row[1] -= matched
+                quantity += matched
+                available = max(0.0, available - matched * level.price)
             if quantity <= 1e-9:
                 continue
-            cost = quantity * level.price
-            if cost > self.cash + 1e-9:
-                continue
-            if budget is not None and committed + cost > budget + 1e-9:
-                continue
-            level.filled = True
-            # Book at the better of our limit and the price the book shows.
-            fill_price = level.price
-            book_price = snapshot.up_ask if level.side == "UP" else snapshot.down_ask
-            if book_price is not None and valid_price(book_price):
-                fill_price = min(level.price, float(book_price))
-            fill_cost = quantity * fill_price
-            committed += fill_cost
-            fills.append(RestingLevel(side=level.side, price=fill_price, shares=quantity))
+            level.shares = max(0.0, level.shares - quantity)
+            level.filled = level.shares <= 1e-9
+            if level.filled:
+                level.filled_at = now_mono
+            fills.append(RestingLevel(side=level.side, price=level.price, shares=quantity))
         return fills
 
     def accrue_maker_rewards(
@@ -442,6 +364,7 @@ class PaperPortfolio:
         snapshot,
         *,
         spread_threshold: float = 0.06,
+        share_threshold: float = 100.0,
         now: float | None = None,
     ) -> None:
         """Track how long a reward-qualified ladder rested on the book."""
@@ -458,6 +381,7 @@ class PaperPortfolio:
             return
         qualified = sum(
             level.shares for level in state.unfilled()
+            if level.shares + 1e-9 >= share_threshold
             if abs(level.price - (state.mid_up if level.side == "UP" else 1.0 - state.mid_up))
             <= spread_threshold + 1e-12
         )
@@ -474,11 +398,10 @@ class PaperPortfolio:
     def maker_pair_stats(self, window_seconds: float = 2.0) -> dict:
         """Pair opposite-side maker fills by time and price the real pair cost.
 
-        The wallet's own measured figure is computed the same way: an Up fill and
-        a Down fill within a couple of seconds of each other in the same market
-        are one matched pair, and the pair costs ``up_price + down_price``.
-        Aggregate averages are meaningless when the two sides fill at different
-        mid levels, which is why this pairing is the comparable metric.
+        This is a local diagnostic convention, not the reference wallet's
+        accounting rule: nearby opposite fills are paired by time, and their
+        pair cost is ``up_price + down_price``. Unmatched quantity and inventory
+        risk remain; this statistic is not a guaranteed arbitrage return.
         """
         by_market: dict[str, dict[str, list]] = {}
         for fill in self.maker_fills:
