@@ -20,7 +20,7 @@ from strategy import (
     mid_up_price,
     quote_ladder,
 )
-from trader import PaperTrader
+from trader import LiveBook, LiveTrader, PaperTrader
 
 
 TITLE_WIDTH = 40
@@ -141,6 +141,24 @@ def run(cycles: int, interval: float, config: Config) -> None:
         burst_max_shares=config.burst_max_shares,
     )
     trader = PaperTrader(portfolio)
+    live_book = None
+    if config.live_trading:
+        missing = [n for n, v in (
+            ("PREDICT_API_KEY", config.predict_api_key),
+            ("PREDICT_ACCOUNT_ADDRESS", config.predict_account_address),
+            ("PRIVY_WALLET_PRIVATE_KEY", config.privy_wallet_private_key),
+        ) if not v]
+        if missing:
+            print(f"Live trading needs {', '.join(missing)}; staying on paper")
+        else:
+            live = LiveTrader(
+                api_key=config.predict_api_key,
+                account_address=config.predict_account_address,
+                private_key=config.privy_wallet_private_key,
+                base_url=config.predict_base_url,
+            )
+            live_book = LiveBook(live, log=None)
+            print("Live trading ENABLED: resting ladder will be sent as real orders")
 
     def log(message: str) -> None:
         """Diagnostics stay off the terminal to match the compact console."""
@@ -157,7 +175,8 @@ def run(cycles: int, interval: float, config: Config) -> None:
         if callable(warm_up):
             warm_up(config.ws_warmup_seconds)
         loop = _maker_loop if config.maker_mode else _scan_loop
-        loop(feed, portfolio, trader, cycles, interval, config, say, log)
+        loop(feed, portfolio, trader, cycles, interval, config, say, log,
+             live_book=live_book)
     finally:
         close = getattr(feed, "close", None)
         if callable(close):
@@ -165,7 +184,7 @@ def run(cycles: int, interval: float, config: Config) -> None:
 
 
 def _scan_loop(feed, portfolio, trader, cycles: int, interval: float, config: Config,
-               say, log) -> None:
+               say, log, live_book=None) -> None:
     source = "predict"
     cycle = 0
     last_rest_at = 0.0  # settlement and account reads are REST; keep them off the hot path
@@ -434,8 +453,33 @@ def _maker_line(snapshot, mid_up: float, state, fills: int,
     )
 
 
+
+def _token_ids(feed, snapshot) -> dict:
+    """Map UP/DOWN to the outcome onChainId the order must reference.
+
+    The REST market object carries each outcome's onChainId, which is the tokenId
+    an order is signed over.
+    """
+    markets = getattr(feed, "_markets", None) or []
+    for market in markets:
+        if str(market.get("id")) != str(snapshot.market_id):
+            continue
+        tokens = {}
+        for outcome in market.get("outcomes") or []:
+            name = (outcome.get("name") or "").upper()
+            chain_id = outcome.get("onChainId")
+            if not chain_id:
+                continue
+            if name == "UP":
+                tokens["UP"] = str(chain_id)
+            elif name == "DOWN":
+                tokens["DOWN"] = str(chain_id)
+        return tokens
+    return {}
+
+
 def _maker_loop(feed, portfolio, trader, cycles: int, interval: float, config: Config,
-                say, log) -> None:
+                say, log, live_book=None) -> None:
     """Two-sided bid ladder: re-quote on mid drift, fill when the ask trades down."""
     cycle = 0
     last_rest_at = 0.0
@@ -459,7 +503,10 @@ def _maker_loop(feed, portfolio, trader, cycles: int, interval: float, config: C
                 continue
             break
 
-        portfolio.drop_maker_quotes({snapshot.market_id for snapshot in snapshots})
+        live_ids = {snapshot.market_id for snapshot in snapshots}
+        portfolio.drop_maker_quotes(live_ids)
+        if live_book is not None:
+            live_book.drop(live_ids)
         orders, lines, fills_total = [], [], 0
         for snapshot in snapshots:
             mid_up = mid_up_price(snapshot)
@@ -488,6 +535,12 @@ def _maker_loop(feed, portfolio, trader, cycles: int, interval: float, config: C
                 spread_threshold=config.reward_spread_threshold,
                 share_threshold=config.reward_share_threshold,
             )
+            if live_book is not None:
+                token_ids = _token_ids(feed, snapshot)
+                live_book.sync(
+                    snapshot.market_id, token_ids, ladder,
+                    fee_rate_bps=snapshot.fee_rate_bps,
+                )
             requoted = portfolio.sync_maker_quotes(
                 snapshot, ladder, mid_up=mid_up, requote_ticks=config.requote_ticks,
                 replenish_delay=config.replenish_delay,
@@ -557,6 +610,9 @@ def parse_args() -> argparse.Namespace:
                         help="minimum seconds between WebSocket-driven scans")
     parser.add_argument("--mode", choices=("maker", "taker"), default="maker",
                         help="maker: two-sided bid ladder; taker: directional entries")
+    parser.add_argument("--live", action="store_true",
+                        help="place real orders (needs PREDICT_API_KEY, "
+                             "PREDICT_ACCOUNT_ADDRESS, PRIVY_WALLET_PRIVATE_KEY)")
     parser.add_argument("--offset", type=float, default=Config.quote_offset_cents,
                         help="maker top level distance below the mid, in cents")
     parser.add_argument("--levels", type=int, default=Config.ladder_levels,
@@ -629,7 +685,7 @@ if __name__ == "__main__":
             replenish_delay=args.replenish_delay, burst_levels=args.burst_levels,
             burst_min_shares=args.burst_min_shares,
             burst_max_shares=args.burst_max_shares,
-            skew_cents_max=args.skew_cents,
+            live_trading=args.live, skew_cents_max=args.skew_cents,
             rebalance_trigger_shares=args.rebalance_trigger,
         )
         run(args.cycles, args.interval, config)

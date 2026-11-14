@@ -40,6 +40,8 @@ class Config:
     # --- maker mode: replicate the tracked wallet's two-sided bid ladder ---
     # Measured from 3000 fills: 94.8% maker, 100% Bids, both sides, 1c grid,
     # top level 1c under the mid, ~6 levels, 100 shares per level, pair cost 0.97.
+    # Live orders need all three credentials; anything missing keeps it paper.
+    live_trading: bool = False
     maker_mode: bool = True
     quote_offset_cents: float = 1.0
     ladder_levels: int = 5
@@ -90,3 +92,4 @@ class Config:
     predict_api_key: Optional[str] = os.getenv("PREDICT_API_KEY") or None
     predict_base_url: str = os.getenv("PREDICT_BASE_URL", "https://api.predict.fun").rstrip("/")
     predict_account_address: Optional[str] = os.getenv("PREDICT_ACCOUNT_ADDRESS") or None
+    privy_wallet_private_key: Optional[str] = os.getenv("PRIVY_WALLET_PRIVATE_KEY") or None
