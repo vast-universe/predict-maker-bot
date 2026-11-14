@@ -519,6 +519,7 @@ def _maker_loop(feed, portfolio, trader, cycles: int, interval: float, config: C
                 levels=config.ladder_levels,
                 step_cents=config.ladder_step_cents,
                 level_shares=config.level_shares,
+                level_notional=config.level_notional,
                 min_price=config.quote_min_price,
                 max_price=config.quote_max_price,
                 skew_cents=_inventory_skew(portfolio, snapshot, config),
@@ -621,6 +622,12 @@ def parse_args() -> argparse.Namespace:
                         help="maker ladder depth per side")
     parser.add_argument("--level-shares", type=float, default=Config.level_shares,
                         help="shares rested on each maker level")
+    parser.add_argument("--level-notional", type=float, default=Config.level_notional,
+                        help="USDT per level (shares = notional / price); 0 uses --level-shares")
+    parser.add_argument("--quote-min", type=float, default=Config.quote_min_price,
+                        help="lowest price the ladder may rest at")
+    parser.add_argument("--quote-max", type=float, default=Config.quote_max_price,
+                        help="highest price the ladder may rest at")
     parser.add_argument("--queue-ramp", type=float, default=Config.queue_ramp,
                         help="seconds for a fresh maker order to earn full queue share")
     parser.add_argument("--replenish-delay", type=float, default=Config.replenish_delay,
@@ -683,7 +690,9 @@ if __name__ == "__main__":
             data_dir=args.data_dir, assets=args.assets, windows_minutes=args.windows,
             min_scan_interval=args.min_scan, maker_mode=args.mode == "maker",
             quote_offset_cents=args.offset, ladder_levels=args.levels,
-            level_shares=args.level_shares, queue_ramp=args.queue_ramp,
+            level_shares=args.level_shares, level_notional=args.level_notional,
+            quote_min_price=args.quote_min, quote_max_price=args.quote_max,
+            queue_ramp=args.queue_ramp,
             replenish_delay=args.replenish_delay, burst_levels=args.burst_levels,
             burst_min_shares=args.burst_min_shares,
             burst_max_shares=args.burst_max_shares,

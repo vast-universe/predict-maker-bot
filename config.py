@@ -52,6 +52,10 @@ class Config:
     # pairable by the other (fixed notional sizing drifts them apart as the price
     # moves).
     level_shares: float = 10.0
+    # Dynamic sizing: when > 0 each level costs this many USDT and the shares
+    # scale as notional / price, so the ladder stays legal at every tick instead
+    # of only above 0.10. Both legs are equalised to the same share count.
+    level_notional: float = 0.0
     quote_min_price: float = 0.10
     quote_max_price: float = 0.90
     requote_ticks: int = 1

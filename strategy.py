@@ -399,6 +399,7 @@ def quote_ladder(
     skew_cents: float = 0.0,
     min_price: float = 0.0,
     max_price: float = 1.0,
+    level_notional: float = 0.0,
 ) -> dict[str, list[QuoteLevel]]:
     """Build the two-sided bid ladder around the book mid.
 
@@ -431,13 +432,63 @@ def quote_ladder(
             if not valid_price(price) or (ladder[side] and price >= ladder[side][-1].price):
                 # Clamping at the bottom tick would stack duplicate levels.
                 continue
-            # Respect the quote band. Below it a 10-share level would be worth
-            # less than Predict's 1 USDT minimum order, so resting there would be
-            # rejected; the band keeps every level legal.
             if not (min_price - 1e-9 <= price <= max_price + 1e-9):
                 continue
-            ladder[side].append(QuoteLevel(price=price, shares=level_shares))
+            # Dynamic sizing: hold each level at a fixed cash cost instead of a
+            # fixed share count. With 10 fixed shares a level is only worth 1 USDT
+            # at 0.10, so 44% of one measured round (mid below 0.11) could not be
+            # quoted at all; scaling the shares as notional / price keeps every
+            # tick legal at a constant 1 USDT of risk per level.
+            shares = level_shares
+            if level_notional > 0:
+                shares = level_notional / price
+            ladder[side].append(QuoteLevel(price=price, shares=shares))
+    if level_notional > 0:
+        ladder = _equalise_shares(ladder, budget=level_notional * levels * 4)
     return ladder
+
+
+def _equalise_shares(ladder: dict[str, list[QuoteLevel]],
+                     budget: float = 0.0) -> dict[str, list[QuoteLevel]]:
+    """Give both legs of each level the same share count, within a cash budget.
+
+    A pair only earns the spread when both legs hold the same number of shares.
+    With notional sizing the two sides sit at different prices, so their share
+    counts differ (at mid 0.30 the Up leg is 3.45 shares and the Down leg 1.45),
+    and every matched pair would leave the excess as one-sided exposure. Taking
+    the larger of the two keeps both legs above the 1 USDT minimum, since the
+    larger count comes from the cheaper side.
+
+    The equalised ladder is then scaled down as a whole so its total cash cost
+    fits ``budget``: at mid 0.05 the equalised sizes commit 196 USDT, two thirds
+    of a 300 USDT balance, which would leave nothing to refill with.
+    """
+    up = list(ladder.get("UP") or [])
+    down = list(ladder.get("DOWN") or [])
+    if not up or not down:
+        return ladder
+
+    paired = min(len(up), len(down))
+    merged: dict[str, list[QuoteLevel]] = {"UP": [], "DOWN": []}
+    for index in range(paired):
+        shares = max(up[index].shares, down[index].shares)
+        merged["UP"].append(QuoteLevel(price=up[index].price, shares=shares))
+        merged["DOWN"].append(QuoteLevel(price=down[index].price, shares=shares))
+    # Levels one side does not have stay at their own size.
+    merged["UP"].extend(up[paired:])
+    merged["DOWN"].extend(down[paired:])
+
+    if budget <= 0:
+        return merged
+    total = sum(level.price * level.shares
+                for side in ("UP", "DOWN") for level in merged[side])
+    if total <= budget + 1e-9:
+        return merged
+    scale = budget / total
+    return {
+        side: [QuoteLevel(price=l.price, shares=l.shares * scale) for l in levels]
+        for side, levels in merged.items()
+    }
 
 
 def evaluate_rebalance_take(
