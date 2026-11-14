@@ -331,16 +331,16 @@ class PaperPortfolio:
 
     def collect_maker_fills(self, snapshot, *, budget: float | None = None,
                             queue_ramp: float | None = None,
-                            max_fill_distance: float | None = 0.03) -> list[RestingLevel]:
-        """Fill a resting bid only when the book at its tick is fully swept.
+                            max_fill_distance: float | None = None) -> list[RestingLevel]:
+        """Fill resting bids from book depth, sharing each print by queue order.
 
         Our simulated order is not in the real book, so a depth change at a tick
-        is the whole market trading there, not our share of it. Queue priority
-        decides what we get: a bid one tick behind the best price sits behind
-        every order already resting at that tick, so it only trades once that
-        tick is cleared. Splitting prints proportionally instead let a thin tick
-        hand most of its volume to us and pushed the fill rate to ~280/min
-        against the wallet's 33/min.
+        is the whole market trading there rather than our share of it. The share
+        we take is our size against the depth normally resting at that tick, then
+        limited by the per-burst caps. Booking the full print instead let a thin
+        tick hand most of its volume to us (280 fills/min against the wallet's
+        33), and waiting for the tick to clear made every fill land after the
+        price had already moved (pair cost 1.05).
         """
         state = self.maker_quotes.get(snapshot.market_id)
         if state is None:
@@ -423,7 +423,9 @@ class PaperPortfolio:
             if burst_cap is not None:
                 remaining = burst_cap - burst_taken
                 if remaining <= 1e-9:
-                    break
+                    # Skip this level but keep scanning: a plain break would end
+                    # the loop and could starve the other side entirely.
+                    continue
                 quantity = min(quantity, remaining)
             # One snapshot can span several seconds of price movement, during
             # which every tick in between shows less depth and would all be
@@ -455,7 +457,6 @@ class PaperPortfolio:
             if book_price is not None and valid_price(book_price):
                 fill_price = min(level.price, float(book_price))
             fill_cost = quantity * fill_price
-            cost = fill_cost
             taken_per_side[level.side] = taken_per_side.get(level.side, 0) + 1
             burst_taken += quantity
             committed += fill_cost
