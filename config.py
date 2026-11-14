@@ -68,9 +68,6 @@ class Config:
     skew_cents_max: float = 0.0  # measured wallet quotes both sides symmetrically
     # None means a single market may use any amount, bounded only by free cash.
     maker_market_budget: Optional[float] = None
-    # Measured: fills at 0.01/0.02 exist but are far rarer than mid prices, so the
-    # ladder shrinks (not disappears) at extreme prices where the 2% taker fee and
-    # the near-total loss risk dominate the tiny absolute edge.
     # The wallet rebalances by taking: 5% of its fills are aggressive buys on the
     # under-weighted side, which keeps its Up/Down ratio near 0.97.
     # The wallet never takes to flatten: every taker-flagged fill of its 4,200
@@ -82,8 +79,6 @@ class Config:
     rebalance_trigger_shares: float = 0.0
     rebalance_take_shares: float = 10.0
     rebalance_cooldown: float = 8.0
-    low_price_shrink_below: float = 0.05
-    low_price_shrink_factor: float = 0.3
     reward_spread_threshold: float = 0.06
     reward_share_threshold: float = 100.0
     # The scan is WebSocket driven: a pushed book rescans after a short debounce,

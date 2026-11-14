@@ -397,8 +397,6 @@ def quote_ladder(
     step_cents: float = 1.0,
     level_shares: float = 100.0,
     skew_cents: float = 0.0,
-    low_price_shrink_below: float = 0.05,
-    low_price_shrink_factor: float = 0.3,
 ) -> dict[str, list[QuoteLevel]]:
     """Build the two-sided bid ladder around the book mid.
 
@@ -431,13 +429,10 @@ def quote_ladder(
             if not valid_price(price) or (ladder[side] and price >= ladder[side][-1].price):
                 # Clamping at the bottom tick would stack duplicate levels.
                 continue
-            # Extreme prices still get quoted (the wallet does trade 0.01/0.02),
-            # just with far less size: the absolute edge is tiny there while the
-            # loss risk is near total.
-            shares = level_shares
-            if price < low_price_shrink_below:
-                shares = level_shares * max(0.0, low_price_shrink_factor)
-            ladder[side].append(QuoteLevel(price=price, shares=shares))
+            # Full size at every price. The wallet does not shrink at the tails:
+            # its median fill below 0.05 is 10.0 shares against 10.7 in the middle,
+            # so a size cut there would be our own invention, not its behaviour.
+            ladder[side].append(QuoteLevel(price=price, shares=level_shares))
     return ladder
 
 

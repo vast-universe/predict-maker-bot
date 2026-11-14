@@ -128,7 +128,18 @@ def run(cycles: int, interval: float, config: Config) -> None:
         base_url=config.predict_base_url,
     )
     source = "predict"
-    portfolio = PaperPortfolio(config.starting_cash, Path(config.data_dir), source)
+    # Thread the maker tuning through explicitly: PaperPortfolio carries its own
+    # defaults, so anything set in Config that is not passed here is silently
+    # ignored.
+    portfolio = PaperPortfolio(
+        config.starting_cash, Path(config.data_dir), source,
+        replenish_delay=config.replenish_delay,
+        queue_ramp=config.queue_ramp,
+        queue_depth_floor=config.queue_depth_floor,
+        burst_levels=config.burst_levels,
+        burst_min_shares=config.burst_min_shares,
+        burst_max_shares=config.burst_max_shares,
+    )
     trader = PaperTrader(portfolio)
 
     def log(message: str) -> None:
@@ -462,14 +473,11 @@ def _maker_loop(feed, portfolio, trader, cycles: int, interval: float, config: C
                 step_cents=config.ladder_step_cents,
                 level_shares=config.level_shares,
                 skew_cents=_inventory_skew(portfolio, snapshot, config),
-                low_price_shrink_below=config.low_price_shrink_below,
-                low_price_shrink_factor=config.low_price_shrink_factor,
             )
             # Fill the ladder that was resting through this book first: the mid
             # has already moved, so those bids are the ones a taker just hit.
             fills = portfolio.collect_maker_fills(
                 snapshot, budget=_market_budget(portfolio, config),
-                queue_ramp=config.queue_ramp,
                 max_fill_distance=config.max_fill_distance)
             for level in fills:
                 orders.append(_maker_opportunity(snapshot, level, mid_up))
@@ -565,6 +573,11 @@ def parse_args() -> argparse.Namespace:
                         help="minimum print size that counts as a hit on our level")
     parser.add_argument("--burst-max-shares", type=float, default=Config.burst_max_shares,
                         help="shares one snapshot may take in total")
+    parser.add_argument("--skew-cents", type=float, default=Config.skew_cents_max,
+                        help="max inventory skew per side in cents (0 = symmetric, as measured)")
+    parser.add_argument("--rebalance-trigger", type=float,
+                        default=Config.rebalance_trigger_shares,
+                        help="net exposure that triggers a rebalance take (0 disables)")
     parser.add_argument("--assets", default=",".join(Config.assets),
                         help="comma-separated assets, e.g. BTC,ETH,BNB")
     parser.add_argument("--windows", default=",".join(str(w) for w in Config.windows_minutes),
@@ -616,6 +629,8 @@ if __name__ == "__main__":
             replenish_delay=args.replenish_delay, burst_levels=args.burst_levels,
             burst_min_shares=args.burst_min_shares,
             burst_max_shares=args.burst_max_shares,
+            skew_cents_max=args.skew_cents,
+            rebalance_trigger_shares=args.rebalance_trigger,
         )
         run(args.cycles, args.interval, config)
     except KeyboardInterrupt:
