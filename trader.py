@@ -140,14 +140,29 @@ class LiveTrader:
         return self.token
 
     def _order_builder(self):
+        """Build the signer, preferring the Predict-account mode when it applies.
+
+        Passing predict_account makes the SDK verify on chain that the key owns
+        the account (ecdsaValidatorStorage). That only holds for a Privy-managed
+        account; a plain EOA has no such record, so fall back to signing directly
+        instead of failing outright.
+        """
         if self.builder is not None:
             return self.builder
         from predict_sdk import ChainId, OrderBuilder, OrderBuilderOptions
-        self.builder = OrderBuilder.make(
-            ChainId.BNB_MAINNET,
-            self.private_key,
-            OrderBuilderOptions(predict_account=self.account_address),
-        )
+        if self.account_address:
+            try:
+                self.builder = OrderBuilder.make(
+                    ChainId.BNB_MAINNET, self.private_key,
+                    OrderBuilderOptions(predict_account=self.account_address),
+                )
+                return self.builder
+            except Exception as error:  # noqa: BLE001 - ownership check is optional
+                self.errors.append(
+                    f"predict_account mode unavailable ({type(error).__name__}); "
+                    f"signing as a plain EOA"
+                )
+        self.builder = OrderBuilder.make(ChainId.BNB_MAINNET, self.private_key)
         return self.builder
 
     # --------------------------------------------------------------- orders
@@ -155,25 +170,38 @@ class LiveTrader:
                     fee_rate_bps: float, side: str = "BUY",
                     is_neg_risk: bool = False, is_yield_bearing: bool = False) -> dict:
         """Sign a BUY limit order and post it. Returns the API response data."""
-        from predict_sdk import BuildOrderInput, Side
+        from predict_sdk import BuildOrderInput, LimitHelperInput, Side
+        builder = self._order_builder()
+        side_enum = Side.BUY if side.upper() == "BUY" else Side.SELL
         price_wei = int(round(price * WEI))
         quantity_wei = int(round(quantity * WEI))
-        order = self._order_builder().build_order("LIMIT", BuildOrderInput(
-            side=Side.BUY if side.upper() == "BUY" else Side.SELL,
+        # Let the SDK derive the amounts: maker_amount is the collateral paid on a
+        # BUY ((price * qty) / precision) and taker_amount is the share count, not
+        # 1e18-scaled copies of both. It also enforces the 1e16 minimum quantity
+        # and truncates to the digit counts the exchange accepts.
+        amounts = builder.get_limit_order_amounts(LimitHelperInput(
+            side=side_enum,
+            price_per_share_wei=price_wei,
+            quantity_wei=quantity_wei,
+        ))
+        order = builder.build_order("LIMIT", BuildOrderInput(
+            side=side_enum,
             token_id=str(token_id),
-            maker_amount=str(price_wei),      # BUY: collateral paid
-            taker_amount=str(quantity_wei),   # BUY: shares received
+            maker_amount=str(amounts.maker_amount),
+            taker_amount=str(amounts.taker_amount),
             fee_rate_bps=str(int(fee_rate_bps)),
             signer=self.account_address,
         ))
-        builder = self._order_builder()
-        signed = builder.sign_typed_data_order(
-            builder.build_typed_data(order, is_neg_risk=is_neg_risk,
-                                     is_yield_bearing=is_yield_bearing)
+        typed_data = builder.build_typed_data(
+            order, is_neg_risk=is_neg_risk, is_yield_bearing=is_yield_bearing
         )
+        signed = builder.sign_typed_data_order(typed_data)
+        # sign_typed_data_order leaves `hash` unset; the order hash the API wants
+        # comes from the typed-data hash.
+        order_hash = builder.build_typed_data_hash(typed_data)
         response = self._request("POST", "orders", {"data": {
             "order": {
-                "hash": signed.hash,
+                "hash": order_hash,
                 "salt": str(signed.salt),
                 "maker": signed.maker,
                 "signer": signed.signer,
