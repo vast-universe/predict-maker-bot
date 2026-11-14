@@ -538,7 +538,7 @@ def _maker_loop(feed, portfolio, trader, cycles: int, interval: float, config: C
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Predict.fun paper trading bot")
     parser.add_argument("--cycles", type=int, default=0, help="number of scans; 0 runs continuously")
-    parser.add_argument("--interval", type=float, default=5.0,
+    parser.add_argument("--interval", type=float, default=12.0,
                         help="max seconds between scans; a pushed book rescans sooner")
     parser.add_argument("--min-scan", type=float, default=Config.min_scan_interval,
                         help="minimum seconds between WebSocket-driven scans")
@@ -554,6 +554,10 @@ def parse_args() -> argparse.Namespace:
                         help="seconds for a fresh maker order to earn full queue share")
     parser.add_argument("--replenish-delay", type=float, default=Config.replenish_delay,
                         help="seconds before a taken maker tick may re-quote")
+    parser.add_argument("--burst-levels", type=float, default=Config.burst_levels,
+                        help="levels one snapshot may take per side")
+    parser.add_argument("--burst-min-shares", type=float, default=Config.burst_min_shares,
+                        help="minimum print size that counts as a hit on our level")
     parser.add_argument("--assets", default=",".join(Config.assets),
                         help="comma-separated assets, e.g. BTC,ETH,BNB")
     parser.add_argument("--windows", default=",".join(str(w) for w in Config.windows_minutes),
@@ -602,7 +606,8 @@ if __name__ == "__main__":
             min_scan_interval=args.min_scan, maker_mode=args.mode == "maker",
             quote_offset_cents=args.offset, ladder_levels=args.levels,
             level_shares=args.level_shares, queue_ramp=args.queue_ramp,
-            replenish_delay=args.replenish_delay,
+            replenish_delay=args.replenish_delay, burst_levels=args.burst_levels,
+            burst_min_shares=args.burst_min_shares,
         )
         run(args.cycles, args.interval, config)
     except KeyboardInterrupt:

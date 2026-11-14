@@ -56,7 +56,7 @@ class Config:
     burst_levels: float = 2.0
     # Wallet bursts move a median of 79 shares; smaller depth wobbles are
     # noise and must not register as a hit on our level.
-    burst_min_shares: float = 25.0
+    burst_min_shares: float = 100.0
     # Deep levels fill at cheap prices when a print sweeps through them, which
     # is where the maker earns its spread. Capping how far below the touch a
     # level may fill removed exactly those fills and pushed the paired cost from
@@ -81,7 +81,7 @@ class Config:
     reward_share_threshold: float = 100.0
     # The scan is WebSocket driven: a pushed book rescans after a short debounce,
     # but never more often than min_scan_interval and never later than interval.
-    min_scan_interval: float = 3.0
+    min_scan_interval: float = 6.0
     scan_debounce: float = 0.25
     ws_warmup_seconds: float = 3.0
     data_dir: str = "paper_data"
