@@ -399,9 +399,6 @@ class PredictWebSocketFeed:
         if self._socket is not None:
             await self._socket.close()
 
-    def _route(self, message: dict) -> None:
-        self._dispatch(None, message)
-
     async def _handle(self, socket, raw: str) -> None:
         try:
             message = json.loads(raw)

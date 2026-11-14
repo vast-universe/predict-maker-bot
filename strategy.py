@@ -441,20 +441,6 @@ def quote_ladder(
     return ladder
 
 
-def quote_is_reward_qualified(
-    price: float,
-    mid: float,
-    *,
-    spread_threshold: float = 0.06,
-    shares: float = 100.0,
-    share_threshold: float = 100.0,
-) -> bool:
-    """Predict pays maker rewards only for size inside the spread band."""
-    if not valid_price(price) or shares + 1e-9 < share_threshold:
-        return False
-    return abs(float(mid) - float(price)) <= spread_threshold + 1e-12
-
-
 def evaluate_rebalance_take(
     market: MarketSnapshot,
     *,

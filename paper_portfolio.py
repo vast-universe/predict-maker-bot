@@ -82,6 +82,7 @@ class PaperPortfolio:
     queue_depth_floor: float = 269.0  # median depth resting at our tick (measured)
     burst_levels: float = 2.0  # levels one snapshot may take per side
     burst_min_shares: float = 25.0  # a print smaller than this is noise, not a hit
+    burst_max_shares: float = 79.0  # shares one snapshot may take in total (measured burst)
 
     def __post_init__(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
@@ -355,14 +356,17 @@ class PaperPortfolio:
         # against the wallet's 9.8. Cap how many levels one snapshot may take,
         # closest to the mid first (that is where a print consumes first).
         per_side_cap = max(1, int(round(self.burst_levels))) if self.burst_levels else None
+        burst_cap = self.burst_max_shares if self.burst_max_shares else None
+        burst_taken = 0.0
         taken_per_side = {"UP": 0, "DOWN": 0}
+        # Interleave the sides by distance to their own mid. Sorting by side
+        # first made "DOWN" (alphabetically before "UP") consume the whole
+        # burst budget, which pushed the Up/Down ratio to 0.33.
         ordered = sorted(
             state.unfilled(),
-            key=lambda lv: (
-                lv.side,
-                abs(lv.price - (state.mid_up if lv.side == "UP" else 1.0 - state.mid_up)),
+            key=lambda lv: abs(
+                lv.price - (state.mid_up if lv.side == "UP" else 1.0 - state.mid_up)
             ),
-            reverse=False,
         )
         for level in ordered:
             tick = round(level.price, precision)
@@ -413,6 +417,14 @@ class PaperPortfolio:
                 level.shares,
                 traded_at_level * level.shares / queue_total * ramp,
             )
+            # One snapshot can span several seconds of takers, so its total must
+            # not exceed what a single burst clears in the real book (median 79
+            # shares against the 143 we were booking).
+            if burst_cap is not None:
+                remaining = burst_cap - burst_taken
+                if remaining <= 1e-9:
+                    break
+                quantity = min(quantity, remaining)
             # One snapshot can span several seconds of price movement, during
             # which every tick in between shows less depth and would all be
             # counted as our fill (the median simultaneous fill spanned 28
@@ -432,6 +444,7 @@ class PaperPortfolio:
             else:
                 level.shares -= quantity
             taken_per_side[level.side] = taken_per_side.get(level.side, 0) + 1
+            burst_taken += quantity
             committed += cost
             fills.append(RestingLevel(side=level.side, price=level.price, shares=quantity))
         return fills

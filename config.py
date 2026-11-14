@@ -57,6 +57,9 @@ class Config:
     # Wallet bursts move a median of 79 shares; smaller depth wobbles are
     # noise and must not register as a hit on our level.
     burst_min_shares: float = 100.0
+    # One 6s snapshot merges several takers; the wallet's bursts clear a
+    # median of 79 shares, so cap a snapshot's total at that.
+    burst_max_shares: float = 79.0
     # Deep levels fill at cheap prices when a print sweeps through them, which
     # is where the maker earns its spread. Capping how far below the touch a
     # level may fill removed exactly those fills and pushed the paired cost from

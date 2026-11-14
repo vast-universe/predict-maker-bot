@@ -558,6 +558,8 @@ def parse_args() -> argparse.Namespace:
                         help="levels one snapshot may take per side")
     parser.add_argument("--burst-min-shares", type=float, default=Config.burst_min_shares,
                         help="minimum print size that counts as a hit on our level")
+    parser.add_argument("--burst-max-shares", type=float, default=Config.burst_max_shares,
+                        help="shares one snapshot may take in total")
     parser.add_argument("--assets", default=",".join(Config.assets),
                         help="comma-separated assets, e.g. BTC,ETH,BNB")
     parser.add_argument("--windows", default=",".join(str(w) for w in Config.windows_minutes),
@@ -608,6 +610,7 @@ if __name__ == "__main__":
             level_shares=args.level_shares, queue_ramp=args.queue_ramp,
             replenish_delay=args.replenish_delay, burst_levels=args.burst_levels,
             burst_min_shares=args.burst_min_shares,
+            burst_max_shares=args.burst_max_shares,
         )
         run(args.cycles, args.interval, config)
     except KeyboardInterrupt:
